@@ -27,7 +27,7 @@ from hermes_trading.adapters import price as price_adapter
 from hermes_trading.adapters import macro as macro_adapter
 from hermes_trading.adapters import news as news_adapter
 from hermes_trading.adapters import onchain as onchain_adapter
-from hermes_trading.score import score as compute_score
+from hermes_trading.reflect import reflect_fallback, reflect_hermes, load_current_state
 
 logger = logging.getLogger("hermes-trading.loop")
 
@@ -40,6 +40,7 @@ GOAL_PATH = STATE_DIR / "goal.yaml"
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds, exponential
 CIRCUIT_BREAKER_LIMIT = 5
+REFLECTION_INTERVAL = 5  # trigger reflection every N closed trades
 
 
 class CircuitBreakerOpen(Exception):
@@ -56,6 +57,7 @@ class TradingLoop:
         self._consecutive_failures = 0
         self._open_position: dict | None = None
         self._strategy_version: str = "01"
+        self._last_reflected_count: int = 0  # closed trades count at last reflection
 
     async def run(self):
         """Run the main loop — fetch, evaluate, act, heartbeat. Forever."""
@@ -96,11 +98,14 @@ class TradingLoop:
         # 4. Check existing position
         await self._check_position(price_data)
 
-        # 5. Act on signal
+        # 5. Auto-reflection: check if enough closed trades accumulated
+        self._check_reflection()
+
+        # 6. Act on signal
         if entry_signal and not self._open_position and self._mode == "paper":
             await self._paper_trade(price_data, strategy, macro_data)
 
-        # 6. Write heartbeat
+        # 7. Write heartbeat
         tick_duration = time.perf_counter() - tick_start
         self._write_heartbeat(tick_duration, price_data, macro_data)
 
@@ -267,6 +272,37 @@ class TradingLoop:
         )
         self._append_trade(self._open_position.copy())
         self._open_position = None
+
+    def _check_reflection(self):
+        """Trigger reflection if enough new closed trades accumulated."""
+        if not TRADES_PATH.exists():
+            return
+
+        closed_count = 0
+        for line in TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n"):
+            if not line.strip():
+                continue
+            trade = json.loads(line)
+            if trade.get("status") == "closed":
+                closed_count += 1
+
+        new_closed = closed_count - self._last_reflected_count
+        if new_closed >= REFLECTION_INTERVAL:
+            logger.info(f"Auto-reflection triggered: {new_closed} new closed trades since last reflect")
+            try:
+                strategy, trades, goal = load_current_state()
+                if strategy and goal:
+                    if os.getenv("ANTHROPIC_API_KEY"):
+                        result = reflect_hermes(strategy, trades, goal)
+                    else:
+                        result = reflect_fallback(strategy, trades, goal)
+                    if result:
+                        self._strategy_version = result.get("version", self._strategy_version)
+                        logger.info(f"Reflection complete — strategy now v{self._strategy_version}")
+            except Exception as e:
+                logger.error(f"Reflection failed: {e}")
+            finally:
+                self._last_reflected_count = closed_count
 
     def _append_trade(self, trade: dict):
         """Append a trade record to trades.jsonl."""
