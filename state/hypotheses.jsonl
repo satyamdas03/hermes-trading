@@ -1,1 +1,1 @@
-{"timestamp": "2026-05-23T00:17:34.353914+00:00", "reflector": "fallback", "from_version": "01", "to_version": "02", "variable_changed": "entry.threshold: 30 -> 28", "reason": "Realised return -0.09% below target +5% \u2014 loosened entry", "score_before": 0.3319, "num_trades_considered": 4}
+{"timestamp": "2026-05-23T00:17:34.353914+00:00", "reflector": "fallback", "from_version": "01", "to_version": "02", "variable_changed": "entry.threshold: 30 -> 28", "reason": "Realised return -0.09% below target +5% — loosened entry", "score_before": 0.3319, "num_trades_considered": 4}

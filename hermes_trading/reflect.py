@@ -136,6 +136,153 @@ def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | N
     return strategy
 
 
+def reflect_hermes_cli(strategy: dict, trades: list[dict], goal: dict) -> dict | None:
+    """Production reflection via Hermes CLI subprocess (master prompt architecture).
+
+    Calls `hermes -z` with the reflection prompt, parses JSON from stdout.
+    Requires Hermes CLI installed and ANTHROPIC_API_KEY set.
+    """
+    import subprocess
+
+    if not strategy or not goal:
+        logger.error("Missing strategy or goal")
+        return None
+
+    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    if len(closed_trades) < 3:
+        logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
+        return None
+
+    last_25 = closed_trades[-25:]
+
+    prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
+exactly ONE variable to change in the strategy.
+
+Goal: {json.dumps(goal, indent=2)}
+
+Current strategy:
+{yaml.dump(strategy, default_flow_style=False, sort_keys=False)}
+
+Last {len(last_25)} trades:
+{yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
+
+Respond with ONLY a JSON object:
+{{
+  "variable": "entry.threshold",
+  "old_value": 30,
+  "new_value": 28,
+  "reason": "one sentence explaining why"
+}}
+"""
+
+    hermes_bin = os.getenv("HERMES_BIN", "hermes")
+    model = os.getenv("HERMES_MODEL", "claude-haiku-4-5-20251001")
+
+    # Build clean env for subprocess — inherit only system essentials.
+    # The parent process may have ANTHROPIC_* env vars pointing to Ollama etc.
+    subprocess_env = {
+        k: v for k, v in os.environ.items()
+        if k in ("SYSTEMROOT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP",
+                 "PATH", "COMSPEC", "PATHEXT", "WINDIR", "ProgramFiles", "CommonProgramFiles")
+    }
+    subprocess_env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+    if api_key := os.getenv("ANTHROPIC_API_KEY"):
+        subprocess_env["ANTHROPIC_API_KEY"] = api_key
+
+    try:
+        result = subprocess.run(
+            [hermes_bin, "-m", model, "-z", prompt],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=subprocess_env,
+        )
+
+        if result.returncode != 0:
+            stderr = result.stderr[:300] if result.stderr else "(no stderr)"
+            logger.error(f"Hermes CLI failed (exit {result.returncode}): {stderr}")
+            return None
+
+        response = result.stdout.strip()
+        if not response:
+            logger.error("Hermes CLI returned empty response")
+            return None
+
+    except FileNotFoundError:
+        logger.error(f"Hermes CLI not found at '{hermes_bin}' — install hermes-agent")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("Hermes CLI timed out after 120s")
+        return None
+    except Exception as e:
+        logger.exception(f"Hermes CLI call failed: {e}")
+        return None
+
+    return _apply_claude_reflection(strategy, trades, goal, response)
+
+
+def _apply_claude_reflection(
+    strategy: dict, trades: list[dict], goal: dict, response: str
+) -> dict | None:
+    """Parse Claude's JSON response and apply the strategy change."""
+    # Parse JSON from response
+    if "{" in response and "}" in response:
+        start = response.index("{")
+        end = response.rindex("}") + 1
+        plan = json.loads(response[start:end])
+    else:
+        logger.error(f"Response not JSON: {response[:200]}")
+        return None
+
+    variable = plan.get("variable", "")
+    new_value = plan.get("new_value")
+    reason = plan.get("reason", "No reason provided")
+    old_value = plan.get("old_value")
+
+    # Apply the change
+    old_strategy = dict(strategy)
+    version = int(strategy.get("version", "1"))
+    new_version = f"{version + 1:02d}"
+
+    # Navigate the field path (e.g. "entry.threshold")
+    parts = variable.split(".")
+    target = strategy
+    for part in parts[:-1]:
+        target = target[part]
+    if old_value is None:
+        old_value = target[parts[-1]]
+    target[parts[-1]] = new_value
+
+    strategy["version"] = new_version
+
+    # Save prior to history
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    old_version_stamp = old_strategy.get("version", "01")
+    history_path = HISTORY_DIR / f"v{old_version_stamp}.yaml"
+    shutil.copy(STRATEGY_PATH, history_path)
+    logger.info(f"Prior strategy saved to {history_path}")
+
+    # Write new strategy
+    STRATEGY_PATH.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
+    logger.info(f"Strategy updated via Claude: v{old_version_stamp} -> v{new_version} — {variable}: {old_value} -> {new_value}")
+
+    # Log hypothesis
+    score_before = score_func(trades, goal)
+    hypothesis = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reflector": "claude",
+        "from_version": old_version_stamp,
+        "to_version": new_version,
+        "variable_changed": f"{variable}: {old_value} -> {new_value}",
+        "reason": reason,
+        "score_before": round(score_before, 4),
+        "num_trades_considered": len([t for t in trades if t.get("status") == "closed"]),
+    }
+    _append_hypothesis(hypothesis)
+
+    return strategy
+
+
 def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | None:
     """Production reflection — calls Anthropic API directly with prompt.
 
@@ -190,7 +337,7 @@ Respond with ONLY a JSON object:
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-6-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 1024,
                     "messages": [{"role": "user", "content": prompt}],
                 },
@@ -202,60 +349,7 @@ Respond with ONLY a JSON object:
             data = resp.json()
             response = data["content"][0]["text"]
 
-        # Parse JSON from response
-        if "{" in response and "}" in response:
-            start = response.index("{")
-            end = response.rindex("}") + 1
-            plan = json.loads(response[start:end])
-        else:
-            logger.error(f"Response not JSON: {response[:200]}")
-            return None
-
-        variable = plan.get("variable", "")
-        new_value = plan.get("new_value")
-        reason = plan.get("reason", "No reason provided")
-
-        # Apply the change
-        old_strategy = dict(strategy)
-        version = int(strategy.get("version", "1"))
-        new_version = f"{version + 1:02d}"
-
-        # Navigate the field path (e.g. "entry.threshold")
-        parts = variable.split(".")
-        target = strategy
-        for part in parts[:-1]:
-            target = target[part]
-        old_value = target[parts[-1]]
-        target[parts[-1]] = new_value
-
-        strategy["version"] = new_version
-
-        # Save prior to history
-        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        old_version_stamp = old_strategy.get("version", "01")
-        history_path = HISTORY_DIR / f"v{old_version_stamp}.yaml"
-        shutil.copy(STRATEGY_PATH, history_path)
-        logger.info(f"Prior strategy saved to {history_path}")
-
-        # Write new strategy
-        STRATEGY_PATH.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
-        logger.info(f"Strategy updated via Claude: v{old_version_stamp} -> v{new_version} — {variable}: {old_value} -> {new_value}")
-
-        # Log hypothesis
-        score_before = score_func(trades, goal)
-        hypothesis = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "reflector": "claude",
-            "from_version": old_version_stamp,
-            "to_version": new_version,
-            "variable_changed": f"{variable}: {old_value} -> {new_value}",
-            "reason": reason,
-            "score_before": round(score_before, 4),
-            "num_trades_considered": len(last_25),
-        }
-        _append_hypothesis(hypothesis)
-
-        return strategy
+        return _apply_claude_reflection(strategy, trades, goal, response)
 
     except Exception as e:
         logger.exception(f"Claude reflection failed: {e}")
@@ -279,7 +373,12 @@ def main():
     parser.add_argument(
         "--hermes",
         action="store_true",
-        help="Use Hermes AI for reflection (production)",
+        help="Use Hermes AI for reflection (direct API call)",
+    )
+    parser.add_argument(
+        "--hermes-cli",
+        action="store_true",
+        help="Use Hermes CLI subprocess for reflection (master prompt architecture)",
     )
     args = parser.parse_args()
 
@@ -300,7 +399,9 @@ def main():
 
     logger.info(f"Reflecting on v{strategy.get('version', '?')} with {len(trades)} trades")
 
-    if args.hermes:
+    if args.hermes_cli:
+        result = reflect_hermes_cli(strategy, trades, goal)
+    elif args.hermes:
         result = reflect_hermes(strategy, trades, goal)
     else:
         result = reflect_fallback(strategy, trades, goal)

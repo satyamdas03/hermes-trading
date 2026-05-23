@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,7 @@ from hermes_trading.adapters import price as price_adapter
 from hermes_trading.adapters import macro as macro_adapter
 from hermes_trading.adapters import news as news_adapter
 from hermes_trading.adapters import onchain as onchain_adapter
-from hermes_trading.reflect import reflect_fallback, reflect_hermes, load_current_state
+from hermes_trading.reflect import reflect_fallback, reflect_hermes, reflect_hermes_cli, load_current_state
 
 logger = logging.getLogger("hermes-trading.loop")
 
@@ -293,7 +294,12 @@ class TradingLoop:
                 strategy, trades, goal = load_current_state()
                 if strategy and goal:
                     if os.getenv("ANTHROPIC_API_KEY"):
-                        result = reflect_hermes(strategy, trades, goal)
+                        # Try Hermes CLI first (master prompt architecture), fall back to direct API
+                        hermes_bin = os.getenv("HERMES_BIN", "hermes")
+                        if shutil.which(hermes_bin):
+                            result = reflect_hermes_cli(strategy, trades, goal)
+                        else:
+                            result = reflect_hermes(strategy, trades, goal)
                     else:
                         result = reflect_fallback(strategy, trades, goal)
                     if result:
