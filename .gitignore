@@ -7,5 +7,6 @@ state/trades.jsonl
 state/watchdog_heartbeat.json
 state/watchdog_state.json
 state/history/
+run_watchdog.bat
 .env
 *.egg-info/
