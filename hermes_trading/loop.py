@@ -1,0 +1,278 @@
+"""24/7 reliability loop — pull data, evaluate strategy, paper trade, log outcome.
+
+Every minute:
+  1. Pull data via adapters (price, macro, news, onchain)
+  2. Evaluate strategy from strategy.yaml
+  3. Decide: paper trade if entry condition fires
+  4. Log outcome to state/trades.jsonl
+  5. Write heartbeat
+
+Retry: 3 attempts per adapter, exponential backoff.
+Circuit break: after 5 consecutive failures, halt and require restart.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from hermes_trading.adapters import price as price_adapter
+from hermes_trading.adapters import macro as macro_adapter
+from hermes_trading.adapters import news as news_adapter
+from hermes_trading.adapters import onchain as onchain_adapter
+from hermes_trading.score import score as compute_score
+
+logger = logging.getLogger("hermes-trading.loop")
+
+STATE_DIR = Path(__file__).resolve().parent.parent / "state"
+STRATEGY_PATH = STATE_DIR / "strategy.yaml"
+TRADES_PATH = STATE_DIR / "trades.jsonl"
+HEARTBEAT_PATH = STATE_DIR / "heartbeat.json"
+GOAL_PATH = STATE_DIR / "goal.yaml"
+
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2  # seconds, exponential
+CIRCUIT_BREAKER_LIMIT = 5
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised when circuit breaker trips after consecutive failures."""
+    pass
+
+
+class TradingLoop:
+    """Main trading loop — single async runner for the worker."""
+
+    def __init__(self, asset: str = "BTC/USDT"):
+        self._asset = asset
+        self._mode = os.getenv("HERMES_TRADING_MODE", "paper")
+        self._consecutive_failures = 0
+        self._open_position: dict | None = None
+        self._strategy_version: str = "01"
+
+    async def run(self):
+        """Run the main loop — fetch, evaluate, act, heartbeat. Forever."""
+        logger.info(f"Trading loop starting — {self._asset} ({self._mode} mode)")
+
+        while True:
+            try:
+                await self._tick()
+                self._consecutive_failures = 0
+            except Exception as e:
+                self._consecutive_failures += 1
+                logger.error(f"Tick failed ({self._consecutive_failures}/{CIRCUIT_BREAKER_LIMIT}): {e}")
+                if self._consecutive_failures >= CIRCUIT_BREAKER_LIMIT:
+                    logger.critical("CIRCUIT BREAKER OPEN — halting loop")
+                    raise CircuitBreakerOpen(
+                        f"Circuit breaker tripped after {CIRCUIT_BREAKER_LIMIT} consecutive failures"
+                    ) from e
+
+            await asyncio.sleep(60)  # 1 tick per minute
+
+    async def _tick(self):
+        """One iteration of the trading loop."""
+        tick_start = time.perf_counter()
+
+        # 1. Pull data from adapters
+        price_data = await self._fetch_with_retry(price_adapter.fetch, self._asset, "kraken", name="price")
+        macro_data = await self._fetch_with_retry(macro_adapter.fetch, name="macro")
+        news_data = await self._fetch_with_retry(news_adapter.fetch, self._asset.split("/")[0], name="news")
+        onchain_data = await self._fetch_with_retry(onchain_adapter.fetch, self._asset.split("/")[0], name="onchain")
+
+        # 2. Load current strategy
+        strategy = self._load_strategy()
+
+        # 3. Evaluate entry condition
+        entry_signal = self._evaluate_entry(price_data, macro_data, strategy)
+
+        # 4. Check existing position
+        await self._check_position(price_data)
+
+        # 5. Act on signal
+        if entry_signal and not self._open_position and self._mode == "paper":
+            await self._paper_trade(price_data, strategy, macro_data)
+
+        # 6. Write heartbeat
+        tick_duration = time.perf_counter() - tick_start
+        self._write_heartbeat(tick_duration, price_data, macro_data)
+
+    async def _fetch_with_retry(self, fetch_fn, *args, name: str = "unknown") -> dict:
+        """Fetch with retries and exponential backoff."""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = await fetch_fn(*args)
+                schema_version = result.get("schema_version")
+                if not schema_version:
+                    raise ValueError(f"Missing schema_version in {name} response")
+                return result
+            except Exception as e:
+                last_error = e
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(f"{name} fetch attempt {attempt + 1}/{MAX_RETRIES} failed: {e}. Retrying in {delay}s")
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(f"{name} fetch failed after {MAX_RETRIES} attempts") from last_error
+
+    def _load_strategy(self) -> dict:
+        """Load strategy from YAML file."""
+        if STRATEGY_PATH.exists():
+            strategy = yaml.safe_load(STRATEGY_PATH.read_text())
+            self._strategy_version = strategy.get("version", "01")
+            return strategy
+        logger.warning("strategy.yaml not found — using defaults")
+        return {
+            "version": "01",
+            "entry": {"indicator": "rsi", "threshold": 30, "direction": "long"},
+            "stop_loss_pct": 2.0,
+            "position_size_r": 0.5,
+        }
+
+    def _evaluate_entry(self, price_data: dict, macro_data: dict, strategy: dict) -> bool:
+        """Evaluate entry condition from strategy."""
+        candles = price_data.get("candles_1m", [])
+        if len(candles) < 30:
+            return False
+
+        entry = strategy.get("entry", {})
+        indicator = entry.get("indicator", "rsi")
+        threshold = entry.get("threshold", 30)
+        direction = entry.get("direction", "long")
+
+        closes = [c["close"] for c in candles[-30:] if c.get("close")]
+
+        if indicator == "rsi" and len(closes) >= 14:
+            rsi = self._compute_rsi(closes, 14)
+            if direction == "long":
+                return rsi < threshold
+            else:
+                return rsi > (100 - threshold)
+
+        return False
+
+    def _compute_rsi(self, closes: list[float], period: int = 14) -> float:
+        """Compute RSI from closing prices."""
+        if len(closes) < period + 1:
+            return 50.0
+
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            if diff > 0:
+                gains.append(diff)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(diff))
+
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    async def _check_position(self, price_data: dict):
+        """Check if open position should be closed (stop-loss hit)."""
+        if not self._open_position:
+            return
+
+        last = price_data.get("last")
+        if not last:
+            return
+
+        entry_price = self._open_position["entry_price"]
+        stop_loss_pct = self._open_position.get("stop_loss_pct", 2.0)
+
+        pnl_pct = (last - entry_price) / entry_price * 100
+
+        if pnl_pct <= -stop_loss_pct:
+            logger.info(f"Stop-loss triggered: {pnl_pct:.2f}% (limit=-{stop_loss_pct}%)")
+            self._close_position(last, "stop_loss")
+        elif pnl_pct >= stop_loss_pct * 1.5:
+            logger.info(f"Take-profit triggered: {pnl_pct:.2f}%")
+            self._close_position(last, "take_profit")
+
+    async def _paper_trade(self, price_data: dict, strategy: dict, macro_data: dict):
+        """Execute a paper trade — log entry to trades.jsonl."""
+        last = price_data.get("last")
+        if not last:
+            return
+
+        position_size_r = strategy.get("position_size_r", 0.5)
+        capital = 10000.0  # paper default
+        qty = (capital * position_size_r) / last
+
+        self._open_position = {
+            "trade_id": f"ppr_{int(time.time())}",
+            "symbol": self._asset,
+            "entry_price": last,
+            "qty": round(qty, 6),
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "stop_loss_pct": strategy.get("stop_loss_pct", 2.0),
+            "strategy_version": strategy.get("version", "01"),
+            "regime": macro_data.get("regime", "unknown"),
+            "status": "open",
+        }
+
+        logger.info(
+            f"PAPER TRADE OPEN: {self._asset} qty={qty:.6f} "
+            f"@ ${last:.2f} | strategy v{strategy.get('version', '01')}"
+        )
+        self._append_trade(self._open_position.copy())
+
+    def _close_position(self, exit_price: float, reason: str):
+        """Close the open position and log."""
+        if not self._open_position:
+            return
+
+        entry = self._open_position["entry_price"]
+        qty = self._open_position["qty"]
+        pnl_usd = (exit_price - entry) * qty
+        pnl_pct = (exit_price - entry) / entry * 100
+
+        self._open_position["exit_price"] = exit_price
+        self._open_position["exit_time"] = datetime.now(timezone.utc).isoformat()
+        self._open_position["exit_reason"] = reason
+        self._open_position["pnl_usd"] = round(pnl_usd, 2)
+        self._open_position["pnl_pct"] = round(pnl_pct, 4)
+        self._open_position["status"] = "closed"
+
+        logger.info(
+            f"PAPER TRADE CLOSED: {reason} | "
+            f"pnl=${pnl_usd:.2f} ({pnl_pct:+.2f}%)"
+        )
+        self._append_trade(self._open_position.copy())
+        self._open_position = None
+
+    def _append_trade(self, trade: dict):
+        """Append a trade record to trades.jsonl."""
+        TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(trade, default=str)
+        with open(TRADES_PATH, "a") as f:
+            f.write(line + "\n")
+
+    def _write_heartbeat(self, tick_duration: float, price_data: dict, macro_data: dict):
+        """Write heartbeat file for monitoring."""
+        heartbeat = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tick_duration_ms": round(tick_duration * 1000, 1),
+            "asset": self._asset,
+            "last_price": price_data.get("last"),
+            "regime": macro_data.get("regime"),
+            "vix": macro_data.get("vix"),
+            "mode": self._mode,
+            "position_open": self._open_position is not None,
+            "strategy_version": self._strategy_version,
+            "consecutive_failures": self._consecutive_failures,
+        }
+        HEARTBEAT_PATH.write_text(json.dumps(heartbeat, indent=2, default=str))

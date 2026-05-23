@@ -1,0 +1,25 @@
+[project]
+name = "hermes-trading"
+version = "0.1.0"
+description = "Self-improving trading agent — worker + Hermes brain"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.4.0",
+    "yfinance>=0.2.40",
+    "pyyaml>=6.0",
+    "httpx>=0.27.0",
+    "aiofiles>=24.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+hermes-trading = "hermes_trading.run:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hermes_trading"]
