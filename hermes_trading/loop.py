@@ -60,6 +60,7 @@ class TradingLoop:
     async def run(self):
         """Run the main loop — fetch, evaluate, act, heartbeat. Forever."""
         logger.info(f"Trading loop starting — {self._asset} ({self._mode} mode)")
+        self._restore_open_position()
 
         while True:
             try:
@@ -180,6 +181,19 @@ class TradingLoop:
             return 100.0
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
+
+    def _restore_open_position(self):
+        """Scan trades.jsonl for open positions lost on restart."""
+        if not TRADES_PATH.exists():
+            return
+        for line in TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n"):
+            if not line.strip():
+                continue
+            trade = json.loads(line)
+            if trade.get("status") == "open":
+                self._open_position = trade
+                logger.info(f"Restored open position: {trade['trade_id']} @ ${trade['entry_price']:.2f}")
+                return  # Only track first open position
 
     async def _check_position(self, price_data: dict):
         """Check if open position should be closed (stop-loss hit)."""
