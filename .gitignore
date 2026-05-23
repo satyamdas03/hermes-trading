@@ -4,5 +4,8 @@ __pycache__/
 .DS_Store
 state/heartbeat.json
 state/trades.jsonl
+state/watchdog_heartbeat.json
+state/watchdog_state.json
+state/history/
 .env
 *.egg-info/
