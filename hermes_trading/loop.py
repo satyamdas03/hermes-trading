@@ -104,7 +104,7 @@ class TradingLoop:
 
             if has_position:
                 # Check stop-loss / take-profit
-                self._check_position(price_data, symbol)
+                await self._check_position(price_data, symbol)
             else:
                 # Evaluate entry
                 entry_signal = self._evaluate_entry(price_data, macro_data, strategy)
