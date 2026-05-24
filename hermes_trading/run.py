@@ -39,7 +39,7 @@ def _ensure_state_files():
 
     if not GOAL_PATH.exists():
         default_goal = {
-            "asset": "BTC/USDT",
+            "assets": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT"],
             "target_return_30d": 0.05,
             "max_drawdown": 0.08,
             "min_sharpe": 1.2,
@@ -84,16 +84,16 @@ def main():
     # Ensure state files exist (volume mount may be empty)
     _ensure_state_files()
 
-    # Load asset from goal.yaml
-    asset = args.asset
-    if not asset:
+    # Load assets from goal.yaml
+    assets = [args.asset] if args.asset else None
+    if not assets:
         goal = yaml.safe_load(GOAL_PATH.read_text())
-        asset = goal.get("asset", "BTC/USDT")
+        assets = goal.get("assets", ["BTC/USDT"])
 
-    logger.info(f"Booting hermes-trading worker — asset={asset}")
+    logger.info(f"Booting hermes-trading worker — assets={assets}")
     logger.info(f"Mode: {__import__('os').getenv('HERMES_TRADING_MODE', 'paper')}")
 
-    loop = TradingLoop(asset=asset)
+    loop = TradingLoop(assets=assets)
     asyncio.run(loop.run())
 
 

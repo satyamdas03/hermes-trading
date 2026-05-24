@@ -1,4 +1,8 @@
-asset: "BTC/USDT"
+assets:
+  - "BTC/USDT"
+  - "ETH/USDT"
+  - "SOL/USDT"
+  - "AVAX/USDT"
 target_return_30d: 0.05          # success
 max_drawdown:      0.08          # failure
 min_sharpe:        1.2           # quality bar
