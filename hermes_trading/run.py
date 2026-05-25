@@ -54,7 +54,7 @@ def _ensure_state_files():
     if not strategy_path.exists():
         default_strategy = {
             "version": "01",
-            "entry": {"indicator": "rsi", "threshold": 30, "direction": "long"},
+            "entry": {"indicator": "rsi", "threshold": 30, "direction": "both"},
             "stop_loss_pct": 2.0,
             "position_size_r": 0.5,
         }

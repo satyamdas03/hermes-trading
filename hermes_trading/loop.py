@@ -107,9 +107,9 @@ class TradingLoop:
                 await self._check_position(price_data, symbol)
             else:
                 # Evaluate entry
-                entry_signal = self._evaluate_entry(price_data, macro_data, strategy)
-                if entry_signal and self._mode == "paper":
-                    await self._paper_trade(price_data, strategy, macro_data, symbol)
+                entry_direction = self._evaluate_entry(price_data, macro_data, strategy)
+                if entry_direction and self._mode == "paper":
+                    await self._paper_trade(price_data, strategy, macro_data, symbol, entry_direction)
 
         # 3. Auto-reflection
         self._check_reflection()
@@ -145,16 +145,16 @@ class TradingLoop:
         logger.warning("strategy.yaml not found — using defaults")
         return {
             "version": "01",
-            "entry": {"indicator": "rsi", "threshold": 30, "direction": "long"},
+            "entry": {"indicator": "rsi", "threshold": 30, "direction": "both"},
             "stop_loss_pct": 2.0,
             "position_size_r": 0.5,
         }
 
-    def _evaluate_entry(self, price_data: dict, macro_data: dict, strategy: dict) -> bool:
-        """Evaluate entry condition from strategy."""
+    def _evaluate_entry(self, price_data: dict, macro_data: dict, strategy: dict) -> str | None:
+        """Evaluate entry condition. Returns 'long', 'short', or None."""
         candles = price_data.get("candles_1m", [])
         if len(candles) < 30:
-            return False
+            return None
 
         entry = strategy.get("entry", {})
         indicator = entry.get("indicator", "rsi")
@@ -165,12 +165,12 @@ class TradingLoop:
 
         if indicator == "rsi" and len(closes) >= 14:
             rsi = self._compute_rsi(closes, 14)
-            if direction == "long":
-                return rsi < threshold
-            else:
-                return rsi > (100 - threshold)
+            if direction in ("long", "both") and rsi < threshold:
+                return "long"
+            if direction in ("short", "both") and rsi > (100 - threshold):
+                return "short"
 
-        return False
+        return None
 
     def _compute_rsi(self, closes: list[float], period: int = 14) -> float:
         """Compute RSI from closing prices."""
@@ -210,7 +210,7 @@ class TradingLoop:
                 logger.info(f"Restored open position: {symbol} {trade['trade_id']} @ ${trade['entry_price']:.2f}")
 
     async def _check_position(self, price_data: dict, symbol: str):
-        """Check if open position should be closed (stop-loss hit)."""
+        """Check if open position should be closed (stop-loss or take-profit hit)."""
         position = self._open_positions.get(symbol)
         if not position:
             return
@@ -221,17 +221,21 @@ class TradingLoop:
 
         entry_price = position["entry_price"]
         stop_loss_pct = position.get("stop_loss_pct", 2.0)
+        direction = position.get("direction", "long")
 
-        pnl_pct = (last - entry_price) / entry_price * 100
+        if direction == "short":
+            pnl_pct = (entry_price - last) / entry_price * 100
+        else:
+            pnl_pct = (last - entry_price) / entry_price * 100
 
         if pnl_pct <= -stop_loss_pct:
-            logger.info(f"Stop-loss triggered {symbol}: {pnl_pct:.2f}% (limit=-{stop_loss_pct}%)")
+            logger.info(f"Stop-loss triggered {symbol} ({direction}): {pnl_pct:.2f}% (limit=-{stop_loss_pct}%)")
             self._close_position(last, "stop_loss", symbol)
         elif pnl_pct >= stop_loss_pct * 1.5:
-            logger.info(f"Take-profit triggered {symbol}: {pnl_pct:.2f}%")
+            logger.info(f"Take-profit triggered {symbol} ({direction}): {pnl_pct:.2f}%")
             self._close_position(last, "take_profit", symbol)
 
-    async def _paper_trade(self, price_data: dict, strategy: dict, macro_data: dict, symbol: str):
+    async def _paper_trade(self, price_data: dict, strategy: dict, macro_data: dict, symbol: str, direction: str):
         """Execute a paper trade — log entry to trades.jsonl."""
         last = price_data.get("last")
         if not last:
@@ -244,6 +248,7 @@ class TradingLoop:
         position = {
             "trade_id": f"ppr_{int(time.time())}",
             "symbol": symbol,
+            "direction": direction,
             "entry_price": last,
             "qty": round(qty, 6),
             "entry_time": datetime.now(timezone.utc).isoformat(),
@@ -255,7 +260,7 @@ class TradingLoop:
         self._open_positions[symbol] = position
 
         logger.info(
-            f"PAPER TRADE OPEN: {symbol} qty={qty:.6f} "
+            f"PAPER TRADE OPEN {direction.upper()}: {symbol} qty={qty:.6f} "
             f"@ ${last:.2f} | strategy v{strategy.get('version', '01')}"
         )
         self._append_trade(position.copy())
@@ -268,8 +273,13 @@ class TradingLoop:
 
         entry = position["entry_price"]
         qty = position["qty"]
-        pnl_usd = (exit_price - entry) * qty
-        pnl_pct = (exit_price - entry) / entry * 100
+        direction = position.get("direction", "long")
+
+        if direction == "short":
+            pnl_usd = (entry - exit_price) * qty
+        else:
+            pnl_usd = (exit_price - entry) * qty
+        pnl_pct = pnl_usd / (entry * qty) * 100
 
         position["exit_price"] = exit_price
         position["exit_time"] = datetime.now(timezone.utc).isoformat()
@@ -279,7 +289,7 @@ class TradingLoop:
         position["status"] = "closed"
 
         logger.info(
-            f"PAPER TRADE CLOSED {symbol}: {reason} | "
+            f"PAPER TRADE CLOSED {symbol} ({direction}): {reason} | "
             f"pnl=${pnl_usd:.2f} ({pnl_pct:+.2f}%)"
         )
         self._append_trade(position.copy())

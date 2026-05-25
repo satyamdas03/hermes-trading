@@ -1,4 +1,4 @@
-"""Reflection cycle — evaluates outcomes and proposes ONE variable change.
+"""Reflection cycle — evaluates outcomes and proposes strategy improvements.
 
 Two modes:
   --fallback : Deterministic rule-based reflection (Phase 5, pre-Hermes).
@@ -45,6 +45,14 @@ def load_current_state() -> tuple[dict | None, list[dict], dict | None]:
     return strategy, trades, goal
 
 
+def _filter_trades(trades: list[dict]) -> list[dict]:
+    """Filter out admin/emergency closes for clean reflection analysis."""
+    return [
+        t for t in trades
+        if not (t.get("exit_reason") or "").startswith("admin_")
+    ]
+
+
 def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | None:
     """Deterministic rule-based reflection. Changes exactly ONE variable.
 
@@ -56,13 +64,14 @@ def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | N
         logger.error("Missing strategy or goal — cannot reflect")
         return None
 
-    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    valid_trades = _filter_trades(trades)
+    closed_trades = [t for t in valid_trades if t.get("status") == "closed"]
     if len(closed_trades) < 3:
         logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
         return None
 
     # Compute current metrics
-    score_val = score_func(trades, goal)
+    score_val = score_func(valid_trades, goal)
     target_return = goal.get("target_return_30d", 0.05)
     max_drawdown = goal.get("max_drawdown", 0.08)
 
@@ -148,7 +157,8 @@ def reflect_hermes_cli(strategy: dict, trades: list[dict], goal: dict) -> dict |
         logger.error("Missing strategy or goal")
         return None
 
-    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    valid_trades = _filter_trades(trades)
+    closed_trades = [t for t in valid_trades if t.get("status") == "closed"]
     if len(closed_trades) < 3:
         logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
         return None
@@ -156,7 +166,7 @@ def reflect_hermes_cli(strategy: dict, trades: list[dict], goal: dict) -> dict |
     last_25 = closed_trades[-25:]
 
     prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
-exactly ONE variable to change in the strategy.
+changes to the strategy to improve performance. You may change up to 3 variables.
 
 Goal: {json.dumps(goal, indent=2)}
 
@@ -166,14 +176,14 @@ Current strategy:
 Last {len(last_25)} trades:
 {yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
 
-Respond with ONLY a JSON object:
+Respond with ONLY a JSON object with a "changes" array:
 {{
-  "variable": "entry.threshold",
-  "old_value": 30,
-  "new_value": 28,
-  "reason": "one sentence explaining why"
-}}
-"""
+  "changes": [
+    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}},
+    {{"variable": "stop_loss_pct", "old_value": 2.0, "new_value": 1.8, "reason": "..."}}
+  ],
+  "summary": "one sentence summary of what changed and why"
+}}"""
 
     hermes_bin = os.getenv("HERMES_BIN", "hermes")
     model = os.getenv("HERMES_MODEL", "claude-haiku-4-5-20251001")
@@ -221,73 +231,11 @@ Respond with ONLY a JSON object:
     return _apply_claude_reflection(strategy, trades, goal, response)
 
 
-def _apply_claude_reflection(
-    strategy: dict, trades: list[dict], goal: dict, response: str
-) -> dict | None:
-    """Parse Claude's JSON response and apply the strategy change."""
-    # Parse JSON from response
-    if "{" in response and "}" in response:
-        start = response.index("{")
-        end = response.rindex("}") + 1
-        plan = json.loads(response[start:end])
-    else:
-        logger.error(f"Response not JSON: {response[:200]}")
-        return None
-
-    variable = plan.get("variable", "")
-    new_value = plan.get("new_value")
-    reason = plan.get("reason", "No reason provided")
-    old_value = plan.get("old_value")
-
-    # Apply the change
-    old_strategy = dict(strategy)
-    version = int(strategy.get("version", "1"))
-    new_version = f"{version + 1:02d}"
-
-    # Navigate the field path (e.g. "entry.threshold")
-    parts = variable.split(".")
-    target = strategy
-    for part in parts[:-1]:
-        target = target[part]
-    if old_value is None:
-        old_value = target[parts[-1]]
-    target[parts[-1]] = new_value
-
-    strategy["version"] = new_version
-
-    # Save prior to history
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    old_version_stamp = old_strategy.get("version", "01")
-    history_path = HISTORY_DIR / f"v{old_version_stamp}.yaml"
-    shutil.copy(STRATEGY_PATH, history_path)
-    logger.info(f"Prior strategy saved to {history_path}")
-
-    # Write new strategy
-    STRATEGY_PATH.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
-    logger.info(f"Strategy updated via Claude: v{old_version_stamp} -> v{new_version} — {variable}: {old_value} -> {new_value}")
-
-    # Log hypothesis
-    score_before = score_func(trades, goal)
-    hypothesis = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "reflector": "claude",
-        "from_version": old_version_stamp,
-        "to_version": new_version,
-        "variable_changed": f"{variable}: {old_value} -> {new_value}",
-        "reason": reason,
-        "score_before": round(score_before, 4),
-        "num_trades_considered": len([t for t in trades if t.get("status") == "closed"]),
-    }
-    _append_hypothesis(hypothesis)
-
-    return strategy
-
-
 def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | None:
     """Production reflection — calls Anthropic API directly with prompt.
 
-    Claude reads the last 25 trades and current strategy, proposes one variable change,
-    and returns a hypothesis.
+    Claude reads the last 25 trades and current strategy, proposes changes,
+    and returns hypotheses.
     """
     import httpx
 
@@ -295,7 +243,8 @@ def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | Non
         logger.error("Missing strategy or goal")
         return None
 
-    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    valid_trades = _filter_trades(trades)
+    closed_trades = [t for t in valid_trades if t.get("status") == "closed"]
     if len(closed_trades) < 3:
         logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
         return None
@@ -303,7 +252,7 @@ def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | Non
     last_25 = closed_trades[-25:]
 
     prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
-exactly ONE variable to change in the strategy.
+changes to the strategy to improve performance. You may change up to 3 variables.
 
 Goal: {json.dumps(goal, indent=2)}
 
@@ -313,14 +262,14 @@ Current strategy:
 Last {len(last_25)} trades:
 {yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
 
-Respond with ONLY a JSON object:
+Respond with ONLY a JSON object with a "changes" array:
 {{
-  "variable": "entry.threshold",
-  "old_value": 30,
-  "new_value": 28,
-  "reason": "one sentence explaining why"
-}}
-"""
+  "changes": [
+    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}},
+    {{"variable": "stop_loss_pct", "old_value": 2.0, "new_value": 1.8, "reason": "..."}}
+  ],
+  "summary": "one sentence summary of what changed and why"
+}}"""
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -354,6 +303,81 @@ Respond with ONLY a JSON object:
     except Exception as e:
         logger.exception(f"Claude reflection failed: {e}")
         return None
+
+
+def _apply_claude_reflection(
+    strategy: dict, trades: list[dict], goal: dict, response: str
+) -> dict | None:
+    """Parse Claude's JSON response and apply strategy changes."""
+    # Parse JSON from response
+    if "{" in response and "}" in response:
+        start = response.index("{")
+        end = response.rindex("}") + 1
+        plan = json.loads(response[start:end])
+    else:
+        logger.error(f"Response not JSON: {response[:200]}")
+        return None
+
+    changes = plan.get("changes", [])
+    if not changes:
+        logger.error("No changes array in response")
+        return None
+
+    summary = plan.get("summary", "No summary provided")
+
+    old_strategy = dict(strategy)
+    version = int(strategy.get("version", "1"))
+    new_version = f"{version + 1:02d}"
+    change_descriptions = []
+
+    for change in changes:
+        variable = change.get("variable", "")
+        new_value = change.get("new_value")
+        old_value = change.get("old_value")
+        reason = change.get("reason", "")
+
+        # Navigate the field path (e.g. "entry.threshold")
+        parts = variable.split(".")
+        target = strategy
+        for part in parts[:-1]:
+            if part not in target:
+                target[part] = {}
+            target = target[part]
+        if old_value is None:
+            old_value = target.get(parts[-1])
+        target[parts[-1]] = new_value
+
+        change_descriptions.append(f"{variable}: {old_value} -> {new_value}")
+
+    strategy["version"] = new_version
+
+    # Save prior to history
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    old_version_stamp = old_strategy.get("version", "01")
+    history_path = HISTORY_DIR / f"v{old_version_stamp}.yaml"
+    shutil.copy(STRATEGY_PATH, history_path)
+    logger.info(f"Prior strategy saved to {history_path}")
+
+    # Write new strategy
+    STRATEGY_PATH.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
+    change_str = ", ".join(change_descriptions)
+    logger.info(f"Strategy updated via Claude: v{old_version_stamp} -> v{new_version} — {change_str}")
+
+    # Log hypothesis
+    score_before = score_func(trades, goal)
+    hypothesis = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reflector": "claude",
+        "from_version": old_version_stamp,
+        "to_version": new_version,
+        "variable_changed": change_str,
+        "reason": summary,
+        "score_before": round(score_before, 4),
+        "num_trades_considered": len([t for t in trades if t.get("status") == "closed"]),
+    }
+    _append_hypothesis(hypothesis)
+
+    return strategy
 
 
 def _append_hypothesis(hypothesis: dict):
