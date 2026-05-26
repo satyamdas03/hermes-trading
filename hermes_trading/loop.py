@@ -19,7 +19,7 @@ import logging
 import os
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -37,11 +37,21 @@ STRATEGY_PATH = STATE_DIR / "strategy.yaml"
 TRADES_PATH = STATE_DIR / "trades.jsonl"
 HEARTBEAT_PATH = STATE_DIR / "heartbeat.json"
 GOAL_PATH = STATE_DIR / "goal.yaml"
+REFLECTION_STATE_PATH = STATE_DIR / "reflection_state.json"
 
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds, exponential
 CIRCUIT_BREAKER_LIMIT = 5
 REFLECTION_INTERVAL = 5  # trigger reflection every N closed trades
+
+DEFAULT_STRATEGY = {
+    "version": "01",
+    "entry": {"indicator": "rsi", "threshold": 30, "direction": "both"},
+    "stop_loss_pct": 2.0,
+    "take_profit_pct": 3.0,
+    "position_size_r": 0.5,
+    "max_position_age_hours": 72,
+}
 
 
 class CircuitBreakerOpen(Exception):
@@ -58,11 +68,12 @@ class TradingLoop:
         self._consecutive_failures = 0
         self._open_positions: dict[str, dict] = {}  # symbol -> position
         self._strategy_version: str = "01"
-        self._last_reflected_count: int = 0  # closed trades count at last reflection
+        self._last_reflected_count: int = self._restore_reflection_state()
 
     async def run(self):
         """Run the main loop — fetch, evaluate, act, heartbeat. Forever."""
         logger.info(f"Trading loop starting — {self._assets} ({self._mode} mode)")
+        logger.info(f"Reflection counter restored: {self._last_reflected_count} closed at last reflection")
         self._restore_open_positions()
 
         while True:
@@ -84,39 +95,52 @@ class TradingLoop:
         """One iteration of the trading loop — check each asset independently."""
         tick_start = time.perf_counter()
 
-        # 1. Shared data (macro/news apply to all assets)
+        # 1. Shared data (macro applies to all assets)
         macro_data = await self._fetch_with_retry(macro_adapter.fetch, name="macro")
         strategy = self._load_strategy()
 
-        # Collect price snapshots for heartbeat
+        # 2. Fetch all price data in parallel (full data with candles)
+        results = await asyncio.gather(
+            *[self._fetch_price_safe(symbol) for symbol in self._assets],
+            return_exceptions=True,
+        )
+        price_data_map: dict[str, dict] = {}
         prices: dict[str, float] = {}
+        for symbol, result in zip(self._assets, results):
+            if isinstance(result, Exception):
+                logger.error(f"Price fetch failed for {symbol}: {result}")
+            elif result:
+                price_data_map[symbol] = result
+                prices[symbol] = result.get("last")
 
-        # 2. Loop over each asset
+        # 3. Evaluate each asset
         for symbol in self._assets:
-            try:
-                price_data = await self._fetch_with_retry(price_adapter.fetch, symbol, "kraken", name=f"price:{symbol}")
-                prices[symbol] = price_data.get("last")
-            except Exception as e:
-                logger.error(f"Price fetch failed for {symbol}: {e}")
+            price_data = price_data_map.get(symbol)
+            if price_data is None:
                 continue
 
             has_position = symbol in self._open_positions
 
             if has_position:
-                # Check stop-loss / take-profit
-                await self._check_position(price_data, symbol)
+                await self._check_position(price_data.get("last"), symbol, strategy)
             else:
-                # Evaluate entry
                 entry_direction = self._evaluate_entry(price_data, macro_data, strategy)
                 if entry_direction and self._mode == "paper":
-                    await self._paper_trade(price_data, strategy, macro_data, symbol, entry_direction)
+                    await self._paper_trade(price_data.get("last"), strategy, macro_data, symbol, entry_direction)
 
-        # 3. Auto-reflection
+        # 4. Auto-reflection
         self._check_reflection()
 
-        # 4. Write heartbeat
+        # 5. Write heartbeat
         tick_duration = time.perf_counter() - tick_start
         self._write_heartbeat(tick_duration, prices, macro_data)
+
+    async def _fetch_price_safe(self, symbol: str) -> dict | None:
+        """Fetch price data for one symbol with retry. Returns full data dict or None."""
+        try:
+            return await self._fetch_with_retry(price_adapter.fetch, symbol, "kraken", name=f"price:{symbol}")
+        except Exception:
+            return None
 
     async def _fetch_with_retry(self, fetch_fn, *args, name: str = "unknown") -> dict:
         """Fetch with retries and exponential backoff."""
@@ -143,12 +167,7 @@ class TradingLoop:
             self._strategy_version = strategy.get("version", "01")
             return strategy
         logger.warning("strategy.yaml not found — using defaults")
-        return {
-            "version": "01",
-            "entry": {"indicator": "rsi", "threshold": 30, "direction": "both"},
-            "stop_loss_pct": 2.0,
-            "position_size_r": 0.5,
-        }
+        return dict(DEFAULT_STRATEGY)
 
     def _evaluate_entry(self, price_data: dict, macro_data: dict, strategy: dict) -> str | None:
         """Evaluate entry condition. Returns 'long', 'short', or None."""
@@ -209,38 +228,73 @@ class TradingLoop:
                 self._open_positions[symbol] = trade
                 logger.info(f"Restored open position: {symbol} {trade['trade_id']} @ ${trade['entry_price']:.2f}")
 
-    async def _check_position(self, price_data: dict, symbol: str):
-        """Check if open position should be closed (stop-loss or take-profit hit)."""
+    def _restore_reflection_state(self) -> int:
+        """Restore _last_reflected_count from disk so restarts don't reset it."""
+        if REFLECTION_STATE_PATH.exists():
+            try:
+                state = json.loads(REFLECTION_STATE_PATH.read_text())
+                count = state.get("last_reflected_count", 0)
+                logger.info(f"Reflection state restored: last_reflected_count={count}")
+                return count
+            except Exception as e:
+                logger.warning(f"Failed to restore reflection state: {e}")
+        return 0
+
+    def _save_reflection_state(self):
+        """Persist _last_reflected_count to disk."""
+        try:
+            REFLECTION_STATE_PATH.write_text(json.dumps({
+                "last_reflected_count": self._last_reflected_count,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to save reflection state: {e}")
+
+    async def _check_position(self, last: float, symbol: str, strategy: dict | None = None):
+        """Check if open position should be closed (stop-loss, take-profit, or time exit)."""
         position = self._open_positions.get(symbol)
         if not position:
             return
 
-        last = price_data.get("last")
-        if not last:
-            return
-
         entry_price = position["entry_price"]
         stop_loss_pct = position.get("stop_loss_pct", 2.0)
+        take_profit_pct = strategy.get("take_profit_pct", 3.0) if strategy else (stop_loss_pct * 1.5)
         direction = position.get("direction", "long")
 
+        # P&L calculation
         if direction == "short":
             pnl_pct = (entry_price - last) / entry_price * 100
         else:
             pnl_pct = (last - entry_price) / entry_price * 100
 
+        # Check time-based exit (stale position)
+        max_age_hours = (strategy or {}).get("max_position_age_hours", 72)
+        entry_time_str = position.get("entry_time", "")
+        if entry_time_str:
+            try:
+                entry_time = datetime.fromisoformat(entry_time_str)
+                age = datetime.now(timezone.utc) - entry_time
+                if age > timedelta(hours=max_age_hours) and abs(pnl_pct) < 0.5:
+                    logger.info(
+                        f"Time exit {symbol}: open {age.total_seconds()/3600:.1f}h "
+                        f"(max={max_age_hours}h), P&L flat at {pnl_pct:+.2f}%"
+                    )
+                    self._close_position(last, "time_exit", symbol)
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        # Stop-loss
         if pnl_pct <= -stop_loss_pct:
             logger.info(f"Stop-loss triggered {symbol} ({direction}): {pnl_pct:.2f}% (limit=-{stop_loss_pct}%)")
             self._close_position(last, "stop_loss", symbol)
-        elif pnl_pct >= stop_loss_pct * 1.5:
-            logger.info(f"Take-profit triggered {symbol} ({direction}): {pnl_pct:.2f}%")
+        # Take-profit
+        elif pnl_pct >= take_profit_pct:
+            logger.info(f"Take-profit triggered {symbol} ({direction}): {pnl_pct:.2f}% (target=+{take_profit_pct}%)")
             self._close_position(last, "take_profit", symbol)
 
-    async def _paper_trade(self, price_data: dict, strategy: dict, macro_data: dict, symbol: str, direction: str):
+    async def _paper_trade(self, last: float, strategy: dict, macro_data: dict, symbol: str, direction: str):
         """Execute a paper trade — log entry to trades.jsonl."""
-        last = price_data.get("last")
-        if not last:
-            return
-
         position_size_r = strategy.get("position_size_r", 0.5)
         capital = 10000.0  # paper default
         qty = (capital * position_size_r) / last
@@ -253,6 +307,7 @@ class TradingLoop:
             "qty": round(qty, 6),
             "entry_time": datetime.now(timezone.utc).isoformat(),
             "stop_loss_pct": strategy.get("stop_loss_pct", 2.0),
+            "take_profit_pct": strategy.get("take_profit_pct", 3.0),
             "strategy_version": strategy.get("version", "01"),
             "regime": macro_data.get("regime", "unknown"),
             "status": "open",
@@ -261,7 +316,8 @@ class TradingLoop:
 
         logger.info(
             f"PAPER TRADE OPEN {direction.upper()}: {symbol} qty={qty:.6f} "
-            f"@ ${last:.2f} | strategy v{strategy.get('version', '01')}"
+            f"@ ${last:.2f} | TP={strategy.get('take_profit_pct', 3.0)}% SL={strategy.get('stop_loss_pct', 2.0)}% "
+            f"| strategy v{strategy.get('version', '01')}"
         )
         self._append_trade(position.copy())
 
@@ -310,7 +366,7 @@ class TradingLoop:
 
         new_closed = closed_count - self._last_reflected_count
         if new_closed >= REFLECTION_INTERVAL:
-            logger.info(f"Auto-reflection triggered: {new_closed} new closed trades since last reflect")
+            logger.info(f"Auto-reflection triggered: {new_closed} new closed trades since last reflect (total={closed_count})")
             try:
                 strategy, trades, goal = load_current_state()
                 if strategy and goal:
@@ -318,10 +374,13 @@ class TradingLoop:
                         # Try Hermes CLI first (master prompt architecture), fall back to direct API
                         hermes_bin = os.getenv("HERMES_BIN", "hermes")
                         if shutil.which(hermes_bin):
+                            logger.info("Using Hermes CLI for reflection")
                             result = reflect_hermes_cli(strategy, trades, goal)
                         else:
+                            logger.info("Using Anthropic API direct for reflection")
                             result = reflect_hermes(strategy, trades, goal)
                     else:
+                        logger.info("No API key — using fallback reflection")
                         result = reflect_fallback(strategy, trades, goal)
                     if result:
                         self._strategy_version = result.get("version", self._strategy_version)
@@ -330,6 +389,7 @@ class TradingLoop:
                 logger.error(f"Reflection failed: {e}")
             finally:
                 self._last_reflected_count = closed_count
+                self._save_reflection_state()
 
     def _append_trade(self, trade: dict):
         """Append a trade record to trades.jsonl."""
@@ -341,13 +401,17 @@ class TradingLoop:
     def _write_heartbeat(self, tick_duration: float, prices: dict[str, float], macro_data: dict):
         """Write heartbeat file for monitoring."""
         open_positions = {
-            symbol: {"entry_price": pos["entry_price"], "qty": pos["qty"]}
+            symbol: {
+                "entry_price": pos["entry_price"],
+                "qty": pos["qty"],
+                "direction": pos.get("direction", "long"),
+            }
             for symbol, pos in self._open_positions.items()
         }
         heartbeat = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tick_duration_ms": round(tick_duration * 1000, 1),
-            "assets": list(prices.keys()),
+            "assets": list(self._assets),
             "prices": prices,
             "regime": macro_data.get("regime"),
             "vix": macro_data.get("vix"),
@@ -355,6 +419,7 @@ class TradingLoop:
             "open_positions": open_positions,
             "position_count": len(self._open_positions),
             "strategy_version": self._strategy_version,
+            "last_reflected_count": self._last_reflected_count,
             "consecutive_failures": self._consecutive_failures,
         }
         HEARTBEAT_PATH.write_text(json.dumps(heartbeat, indent=2, default=str))

@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-import numpy as np
-import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -21,14 +19,16 @@ async def fetch() -> dict:
         Dict with schema_version, timestamp, and macro indicator values.
     """
     try:
-        tickers = yf.download(["^VIX", "^GSPC", "DX-Y.NYB"], period="5d", progress=False)
+        # Fetch individually for reliability (multi-ticker MultiIndex fragile)
+        vix = _fetch_ticker_last("^VIX")
+        spx = _fetch_ticker_last("^GSPC")
+        spx_20d_ago = _fetch_ticker_n_days_ago("^GSPC", 20)
+        dxy = _fetch_ticker_last("DX-Y.NYB")
 
-        vix = _safe_last(tickers, "Close", "^VIX")
-        spx = _safe_last(tickers, "Close", "^GSPC")
-        dxy = _safe_last(tickers, "Close", "DX-Y.NYB")
-
-        # Compute SPX 20-day return for regime classification
-        spx_20d = _safe_return(tickers, "Close", "^GSPC", 20)
+        # Compute SPX 20-day return
+        spx_20d = None
+        if spx is not None and spx_20d_ago is not None and spx_20d_ago > 0:
+            spx_20d = (spx - spx_20d_ago) / spx_20d_ago
 
         return {
             "schema_version": SCHEMA_VERSION,
@@ -53,28 +53,26 @@ async def fetch() -> dict:
         }
 
 
-def _safe_last(df, col: str, ticker: str) -> float | None:
-    """Safely extract last value from multi-level yfinance output."""
+def _fetch_ticker_last(symbol: str) -> float | None:
+    """Fetch last close price for a single ticker."""
     try:
-        if isinstance(df.columns, pd.MultiIndex):
-            val = df[(col, ticker)].dropna().iloc[-1]
-        else:
-            val = df[col].dropna().iloc[-1]
-        return float(val)
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="5d")
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
     except Exception:
         return None
 
 
-def _safe_return(df, col: str, ticker: str, days: int) -> float | None:
-    """Compute rolling return over N days."""
+def _fetch_ticker_n_days_ago(symbol: str, days: int) -> float | None:
+    """Fetch close price from N days ago."""
     try:
-        if isinstance(df.columns, pd.MultiIndex):
-            series = df[(col, ticker)].dropna()
-        else:
-            series = df[col].dropna()
-        if len(series) < days:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=f"{days + 5}d")
+        if len(hist) < days:
             return None
-        return float((series.iloc[-1] - series.iloc[-min(days, len(series))]) / series.iloc[-min(days, len(series))])
+        return float(hist["Close"].iloc[-days])
     except Exception:
         return None
 
