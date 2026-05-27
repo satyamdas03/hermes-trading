@@ -166,7 +166,7 @@ def reflect_hermes_cli(strategy: dict, trades: list[dict], goal: dict) -> dict |
     last_25 = closed_trades[-25:]
 
     prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
-changes to the strategy to improve performance. You may change up to 3 variables.
+ONE change to the strategy to improve performance. You MUST change exactly ONE variable.
 
 Goal: {json.dumps(goal, indent=2)}
 
@@ -176,11 +176,10 @@ Current strategy:
 Last {len(last_25)} trades:
 {yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
 
-Respond with ONLY a JSON object with a "changes" array:
+Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
   "changes": [
-    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}},
-    {{"variable": "stop_loss_pct", "old_value": 2.0, "new_value": 1.8, "reason": "..."}}
+    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}}
   ],
   "summary": "one sentence summary of what changed and why"
 }}"""
@@ -252,7 +251,7 @@ def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | Non
     last_25 = closed_trades[-25:]
 
     prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
-changes to the strategy to improve performance. You may change up to 3 variables.
+ONE change to the strategy to improve performance. You MUST change exactly ONE variable.
 
 Goal: {json.dumps(goal, indent=2)}
 
@@ -262,11 +261,10 @@ Current strategy:
 Last {len(last_25)} trades:
 {yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
 
-Respond with ONLY a JSON object with a "changes" array:
+Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
   "changes": [
-    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}},
-    {{"variable": "stop_loss_pct", "old_value": 2.0, "new_value": 1.8, "reason": "..."}}
+    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}}
   ],
   "summary": "one sentence summary of what changed and why"
 }}"""
@@ -322,6 +320,14 @@ def _apply_claude_reflection(
     if not changes:
         logger.error("No changes array in response")
         return None
+
+    # Enforce one_variable_only guardrail — scientific method
+    if goal.get("one_variable_only", True) and len(changes) > 1:
+        logger.warning(
+            f"Claude proposed {len(changes)} changes but one_variable_only=true. "
+            f"Only applying first: {changes[0].get('variable')}"
+        )
+        changes = changes[:1]
 
     summary = plan.get("summary", "No summary provided")
 
