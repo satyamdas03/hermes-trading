@@ -274,10 +274,10 @@ class TradingLoop:
             try:
                 entry_time = datetime.fromisoformat(entry_time_str)
                 age = datetime.now(timezone.utc) - entry_time
-                if age > timedelta(hours=max_age_hours) and abs(pnl_pct) < 0.5:
+                if age > timedelta(hours=max_age_hours):
                     logger.info(
                         f"Time exit {symbol}: open {age.total_seconds()/3600:.1f}h "
-                        f"(max={max_age_hours}h), P&L flat at {pnl_pct:+.2f}%"
+                        f"(max={max_age_hours}h), P&L {pnl_pct:+.2f}%"
                     )
                     self._close_position(last, "time_exit", symbol)
                     return
