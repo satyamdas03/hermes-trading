@@ -23,12 +23,14 @@ GOAL_PATH = STATE_DIR / "goal.yaml"
 
 def setup_logging():
     """Configure logging — INFO to stdout, DEBUG to file."""
+    sys.stdout.reconfigure(line_buffering=True)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=[handler],
+        force=True,
     )
 
 
