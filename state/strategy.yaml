@@ -1,4 +1,4 @@
-version: '08'
+version: '07'
 entry:
   indicator: rsi
   threshold: 35

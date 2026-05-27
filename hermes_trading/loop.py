@@ -170,9 +170,9 @@ class TradingLoop:
         return dict(DEFAULT_STRATEGY)
 
     def _evaluate_entry(self, price_data: dict, macro_data: dict, strategy: dict) -> str | None:
-        """Evaluate entry condition with trend/volume/timeframe filters. Returns 'long', 'short', or None."""
+        """Evaluate entry condition. Returns 'long', 'short', or None."""
         candles = price_data.get("candles_1m", [])
-        if len(candles) < 50:
+        if len(candles) < 30:
             return None
 
         entry = strategy.get("entry", {})
@@ -180,52 +180,13 @@ class TradingLoop:
         threshold = entry.get("threshold", 30)
         direction = entry.get("direction", "long")
 
-        closes = [c["close"] for c in candles[-50:] if c.get("close")]
-        volumes = [c.get("volume", 0) for c in candles[-50:]]
-        last_close = closes[-1] if closes else None
-        if last_close is None:
-            return None
+        closes = [c["close"] for c in candles[-30:] if c.get("close")]
 
-        # --- Trend filter: EMA(50) ---
-        if len(closes) >= 50:
-            ema50 = self._compute_ema(closes, 50)
-            if ema50:
-                if direction in ("long", "both") and last_close < ema50:
-                    return None  # price below trend, no long
-                if direction in ("short", "both") and last_close > ema50:
-                    return None  # price above trend, no short
-
-        # --- 5m RSI confirmation ---
-        candles_5m = self._resample_to_timeframe(candles, 5)
-        if len(candles_5m) >= 15:
-            closes_5m = [c["close"] for c in candles_5m]
-            rsi_5m = self._compute_rsi(closes_5m, 14)
-        else:
-            rsi_5m = None
-
-        # --- 1m RSI ---
-        rsi_1m = self._compute_rsi(closes, 14)
-
-        # --- Volume spike filter ---
-        vol_ok = True
-        if len(volumes) >= 20:
-            avg_vol = sum(volumes[-20:]) / 20
-            last_vol = volumes[-1]
-            if avg_vol > 0 and last_vol < avg_vol * 1.2:
-                vol_ok = False
-
-        if indicator == "rsi":
-            if direction in ("long", "both") and rsi_1m < threshold:
-                if rsi_5m is not None and rsi_5m >= 50:
-                    return None  # 5m not confirming oversold
-                if not vol_ok:
-                    return None  # no volume conviction
+        if indicator == "rsi" and len(closes) >= 14:
+            rsi = self._compute_rsi(closes, 14)
+            if direction in ("long", "both") and rsi < threshold:
                 return "long"
-            if direction in ("short", "both") and rsi_1m > (100 - threshold):
-                if rsi_5m is not None and rsi_5m <= 50:
-                    return None  # 5m not confirming overbought
-                if not vol_ok:
-                    return None
+            if direction in ("short", "both") and rsi > (100 - threshold):
                 return "short"
 
         return None
@@ -253,58 +214,6 @@ class TradingLoop:
             return 100.0
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
-
-    def _compute_ema(self, values: list[float], period: int) -> float | None:
-        """Compute EMA for a list of values. Returns None if insufficient data."""
-        if len(values) < period:
-            return None
-        multiplier = 2.0 / (period + 1)
-        ema = sum(values[:period]) / period  # SMA seed
-        for v in values[period:]:
-            ema = (v - ema) * multiplier + ema
-        return ema
-
-    def _resample_to_timeframe(self, candles: list[dict], target_minutes: int) -> list[dict]:
-        """Resample 1m candles to higher timeframe (e.g. 5m)."""
-        if not candles or target_minutes <= 1:
-            return candles
-        resampled = []
-        bucket = None
-        for c in candles:
-            ts = c.get("timestamp", 0)
-            bucket_key = ts // (target_minutes * 60_000)
-            if bucket is None or bucket["key"] != bucket_key:
-                if bucket is not None and bucket["count"] > 0:
-                    resampled.append({
-                        "open": bucket["open"],
-                        "high": bucket["high"],
-                        "low": bucket["low"],
-                        "close": bucket["close"],
-                        "volume": bucket["volume"],
-                    })
-                bucket = {
-                    "key": bucket_key,
-                    "open": c.get("open", 0),
-                    "high": c.get("high", 0),
-                    "low": c.get("low", float("inf")),
-                    "close": 0,
-                    "volume": 0,
-                    "count": 0,
-                }
-            bucket["high"] = max(bucket["high"], c.get("high", 0))
-            bucket["low"] = min(bucket["low"], c.get("low", float("inf")))
-            bucket["close"] = c.get("close", 0)
-            bucket["volume"] += c.get("volume", 0)
-            bucket["count"] += 1
-        if bucket is not None and bucket["count"] > 0:
-            resampled.append({
-                "open": bucket["open"],
-                "high": bucket["high"],
-                "low": bucket["low"],
-                "close": bucket["close"],
-                "volume": bucket["volume"],
-            })
-        return resampled
 
     def _restore_open_positions(self):
         """Scan trades.jsonl for open positions lost on restart."""
@@ -349,7 +258,7 @@ class TradingLoop:
 
         entry_price = position["entry_price"]
         stop_loss_pct = position.get("stop_loss_pct", 2.0)
-        take_profit_pct = position.get("take_profit_pct", stop_loss_pct * 1.5)
+        take_profit_pct = strategy.get("take_profit_pct", 3.0) if strategy else (stop_loss_pct * 1.5)
         direction = position.get("direction", "long")
 
         # P&L calculation

@@ -34,7 +34,7 @@ async def fetch(symbol: str = "BTC/USDT", exchange_id: str = "coinbase") -> dict
 
     try:
         ticker = await exchange.fetch_ticker(symbol)
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe="1m", limit=90)
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe="1m", limit=60)
 
         candles = [
             {
