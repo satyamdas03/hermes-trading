@@ -216,17 +216,45 @@ class TradingLoop:
         return 100.0 - (100.0 / (1.0 + rs))
 
     def _restore_open_positions(self):
-        """Scan trades.jsonl for open positions lost on restart."""
+        """Scan trades.jsonl for open positions lost on restart.
+
+        Skips trades that have a later closed record (same trade_id),
+        preventing restoration of already-closed positions.
+        """
         if not TRADES_PATH.exists():
             return
-        for line in TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n"):
+
+        lines = TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n")
+
+        # First pass: collect all trade_ids that are already closed
+        closed_ids = set()
+        for line in lines:
             if not line.strip():
                 continue
-            trade = json.loads(line)
-            if trade.get("status") == "open":
-                symbol = trade.get("symbol", "BTC/USDT")
-                self._open_positions[symbol] = trade
-                logger.info(f"Restored open position: {symbol} {trade['trade_id']} @ ${trade['entry_price']:.2f}")
+            try:
+                trade = json.loads(line)
+                if trade.get("status") == "closed":
+                    closed_ids.add(trade.get("trade_id"))
+            except json.JSONDecodeError:
+                continue
+
+        # Second pass: restore only open trades with no closed duplicate
+        restored = 0
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                trade = json.loads(line)
+                if trade.get("status") == "open" and trade.get("trade_id") not in closed_ids:
+                    symbol = trade.get("symbol", "BTC/USDT")
+                    self._open_positions[symbol] = trade
+                    restored += 1
+                    logger.info(f"Restored open position: {symbol} {trade['trade_id']} @ ${trade['entry_price']:.2f}")
+            except json.JSONDecodeError:
+                continue
+
+        if restored == 0:
+            logger.info("No open positions to restore")
 
     def _restore_reflection_state(self) -> int:
         """Restore _last_reflected_count from disk so restarts don't reset it."""
