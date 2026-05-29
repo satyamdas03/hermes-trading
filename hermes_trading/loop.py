@@ -258,7 +258,7 @@ class TradingLoop:
 
         entry_price = position["entry_price"]
         stop_loss_pct = position.get("stop_loss_pct", 2.0)
-        take_profit_pct = strategy.get("take_profit_pct", 3.0) if strategy else (stop_loss_pct * 1.5)
+        take_profit_pct = position.get("take_profit_pct", stop_loss_pct * 1.5)
         direction = position.get("direction", "long")
 
         # P&L calculation

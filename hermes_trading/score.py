@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def load_trades() -> list[dict]:
     trades = []
     for line in TRADES_PATH.read_text().strip().split("\n"):
         if line.strip():
-            trades.append(yaml.safe_load(line))
+            trades.append(json.loads(line))
     return trades
 
 
