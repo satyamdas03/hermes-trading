@@ -96,11 +96,17 @@ def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | N
     reason = None
 
     # Rule: return below target -> loosen entry threshold
+    # Use explicit keys if present, else fall back to legacy threshold
     if realised_return < target_return:
-        old_threshold = strategy["entry"]["threshold"]
-        new_threshold = old_threshold - 2  # Loosen: e.g. 30 -> 28 (enter earlier)
-        strategy["entry"]["threshold"] = max(10, new_threshold)
-        variable_changed = f"entry.threshold: {old_threshold} -> {strategy['entry']['threshold']}"
+        entry_cfg = strategy.get("entry", {})
+        if "threshold_long" in entry_cfg:
+            old_val = entry_cfg["threshold_long"]
+            entry_cfg["threshold_long"] = max(10, old_val - 2)
+            variable_changed = f"entry.threshold_long: {old_val} -> {entry_cfg['threshold_long']}"
+        else:
+            old_val = entry_cfg["threshold"]
+            entry_cfg["threshold"] = max(10, old_val - 2)
+            variable_changed = f"entry.threshold: {old_val} -> {entry_cfg['threshold']}"
         reason = f"Realised return {realised_return:+.2%} below target {target_return:+.0%} — loosened entry"
     # Rule: drawdown too high -> tighten stop loss
     elif dd > max_drawdown:
@@ -118,29 +124,49 @@ def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | N
 
     strategy["version"] = new_version
 
-    # Save prior version to history
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    # --- Integrity checks & atomic write ---
     old_version = old_strategy.get("version", "01")
+
+    # 1. Verify disk state
+    disk_strategy = yaml.safe_load(STRATEGY_PATH.read_text()) if STRATEGY_PATH.exists() else {}
+    if str(disk_strategy.get("version", "01")) != old_version:
+        logger.error("Version mismatch on disk — aborting fallback reflection")
+        return None
+
+    # 2. Save prior to history
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     history_path = HISTORY_DIR / f"v{old_version}.yaml"
     shutil.copy(STRATEGY_PATH, history_path)
     logger.info(f"Prior strategy saved to {history_path}")
 
-    # Write new strategy
-    STRATEGY_PATH.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
+    # 3. Atomic write
+    temp_path = STRATEGY_PATH.with_suffix(".yaml.tmp")
+    temp_path.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
+    temp_path.replace(STRATEGY_PATH)
+
+    # 4. Verify new version on disk
+    written = yaml.safe_load(STRATEGY_PATH.read_text())
+    if str(written.get("version", "01")) != new_version:
+        logger.error("Write verification failed for fallback reflection")
+        return None
+
     logger.info(f"Strategy updated: v{old_version} -> v{new_version} — {variable_changed}")
 
-    # Log hypothesis
-    hypothesis = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "reflector": "fallback",
-        "from_version": old_version,
-        "to_version": new_version,
-        "variable_changed": variable_changed,
-        "reason": reason,
-        "score_before": round(score_val, 4),
-        "num_trades_considered": len(closed_trades),
-    }
-    _append_hypothesis(hypothesis)
+    # 5. Log hypothesis (best-effort)
+    try:
+        hypothesis = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reflector": "fallback",
+            "from_version": old_version,
+            "to_version": new_version,
+            "variable_changed": variable_changed,
+            "reason": reason,
+            "score_before": round(score_val, 4),
+            "num_trades_considered": len(closed_trades),
+        }
+        _append_hypothesis(hypothesis)
+    except Exception as e:
+        logger.warning(f"Hypothesis logging failed: {e}")
 
     return strategy
 
@@ -176,10 +202,21 @@ Current strategy:
 Last {len(last_25)} trades:
 {yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
 
+THRESHOLD SEMANTICS — READ CAREFULLY:
+- For LONG entries: trigger when RSI < entry.threshold_long
+- For SHORT entries: trigger when RSI > entry.threshold_short
+- If the strategy only has a legacy "entry.threshold" key (no _long/_short), the code derives:
+    long trigger  = RSI < threshold
+    short trigger = RSI > (100 - threshold)
+- This means setting threshold=75 for shorts actually triggers at RSI>25 (nearly always true),
+  which causes overtrading. To avoid this, ALWAYS use the explicit keys:
+    entry.threshold_long  = RSI level below which longs trigger
+    entry.threshold_short = RSI level above which shorts trigger
+
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
   "changes": [
-    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}}
+    {{"variable": "entry.threshold_short", "old_value": 70, "new_value": 75, "reason": "Raise short threshold to 75 so shorts only fire on strong overbought RSI>75, reducing false signals in bull regime"}}
   ],
   "summary": "one sentence summary of what changed and why"
 }}"""
@@ -261,10 +298,21 @@ Current strategy:
 Last {len(last_25)} trades:
 {yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
 
+THRESHOLD SEMANTICS — READ CAREFULLY:
+- For LONG entries: trigger when RSI < entry.threshold_long
+- For SHORT entries: trigger when RSI > entry.threshold_short
+- If the strategy only has a legacy "entry.threshold" key (no _long/_short), the code derives:
+    long trigger  = RSI < threshold
+    short trigger = RSI > (100 - threshold)
+- This means setting threshold=75 for shorts actually triggers at RSI>25 (nearly always true),
+  which causes overtrading. To avoid this, ALWAYS use the explicit keys:
+    entry.threshold_long  = RSI level below which longs trigger
+    entry.threshold_short = RSI level above which shorts trigger
+
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
   "changes": [
-    {{"variable": "entry.threshold", "old_value": 30, "new_value": 28, "reason": "..."}}
+    {"variable": "entry.threshold_short", "old_value": 70, "new_value": 75, "reason": "Raise short threshold to 75 so shorts only fire on strong overbought RSI>75, reducing false signals in bull regime"}
   ],
   "summary": "one sentence summary of what changed and why"
 }}"""
@@ -357,31 +405,59 @@ def _apply_claude_reflection(
 
     strategy["version"] = new_version
 
-    # Save prior to history
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    # --- Integrity checks & atomic write ---
     old_version_stamp = old_strategy.get("version", "01")
+
+    # 1. Verify disk state matches what we loaded (detect races / manual edits)
+    disk_strategy = yaml.safe_load(STRATEGY_PATH.read_text()) if STRATEGY_PATH.exists() else {}
+    disk_version = str(disk_strategy.get("version", "01"))
+    if disk_version != old_version_stamp:
+        logger.error(
+            f"Version mismatch: disk has v{disk_version} but expected v{old_version_stamp}. "
+            f"Aborting reflection to prevent history corruption."
+        )
+        return None
+
+    # 2. Save old version to history BEFORE writing new strategy
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     history_path = HISTORY_DIR / f"v{old_version_stamp}.yaml"
     shutil.copy(STRATEGY_PATH, history_path)
     logger.info(f"Prior strategy saved to {history_path}")
 
-    # Write new strategy
-    STRATEGY_PATH.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
+    # 3. Atomic write: temp file + rename
+    temp_path = STRATEGY_PATH.with_suffix(".yaml.tmp")
+    temp_path.write_text(yaml.dump(strategy, default_flow_style=False, sort_keys=False))
+    temp_path.replace(STRATEGY_PATH)
+
+    # 4. Verify new strategy on disk
+    written_strategy = yaml.safe_load(STRATEGY_PATH.read_text())
+    written_version = str(written_strategy.get("version", "01"))
+    if written_version != new_version:
+        logger.error(
+            f"Write verification failed: expected v{new_version} but disk shows v{written_version}. "
+            f"Reflection state is inconsistent."
+        )
+        return None
+
     change_str = ", ".join(change_descriptions)
     logger.info(f"Strategy updated via Claude: v{old_version_stamp} -> v{new_version} — {change_str}")
 
-    # Log hypothesis
-    score_before = score_func(trades, goal)
-    hypothesis = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "reflector": "claude",
-        "from_version": old_version_stamp,
-        "to_version": new_version,
-        "variable_changed": change_str,
-        "reason": summary,
-        "score_before": round(score_before, 4),
-        "num_trades_considered": len([t for t in trades if t.get("status") == "closed"]),
-    }
-    _append_hypothesis(hypothesis)
+    # 5. Log hypothesis (best-effort; don't crash if this fails)
+    try:
+        score_before = score_func(trades, goal)
+        hypothesis = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reflector": "claude",
+            "from_version": old_version_stamp,
+            "to_version": new_version,
+            "variable_changed": change_str,
+            "reason": summary,
+            "score_before": round(score_before, 4),
+            "num_trades_considered": len([t for t in trades if t.get("status") == "closed"]),
+        }
+        _append_hypothesis(hypothesis)
+    except Exception as e:
+        logger.warning(f"Hypothesis logging failed (strategy already saved): {e}")
 
     return strategy
 

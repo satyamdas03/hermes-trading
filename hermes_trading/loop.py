@@ -177,16 +177,29 @@ class TradingLoop:
 
         entry = strategy.get("entry", {})
         indicator = entry.get("indicator", "rsi")
-        threshold = entry.get("threshold", 30)
         direction = entry.get("direction", "long")
+
+        # Backward-compatible threshold handling:
+        # - Explicit keys (proper): threshold_long (RSI below = long), threshold_short (RSI above = short)
+        # - Legacy key (deprecated): threshold alone. Long = RSI < threshold. Short = RSI > (100 - threshold).
+        # Prefer explicit keys when present to avoid ambiguity.
+        threshold_long = entry.get("threshold_long")
+        threshold_short = entry.get("threshold_short")
+        legacy_threshold = entry.get("threshold")
+
+        # Resolve effective thresholds, falling back to legacy for backward compatibility
+        if threshold_long is None:
+            threshold_long = legacy_threshold if legacy_threshold is not None else 30
+        if threshold_short is None:
+            threshold_short = (100 - legacy_threshold) if legacy_threshold is not None else 70
 
         closes = [c["close"] for c in candles[-30:] if c.get("close")]
 
         if indicator == "rsi" and len(closes) >= 14:
             rsi = self._compute_rsi(closes, 14)
-            if direction in ("long", "both") and rsi < threshold:
+            if direction in ("long", "both") and rsi < threshold_long:
                 return "long"
-            if direction in ("short", "both") and rsi > (100 - threshold):
+            if direction in ("short", "both") and rsi > threshold_short:
                 return "short"
 
         return None
