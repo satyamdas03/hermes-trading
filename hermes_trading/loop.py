@@ -59,6 +59,12 @@ class CircuitBreakerOpen(Exception):
     pass
 
 
+# Fee modeling — Kraken maker/taker blended ~0.21% per side, 0.42% round-trip.
+# These are realistic estimates for market orders on Kraken.
+FEE_RATE_PER_SIDE = 0.0021  # 0.21%
+FEE_RATE_ROUND_TRIP = FEE_RATE_PER_SIDE * 2  # 0.42%
+
+
 class TradingLoop:
     """Main trading loop — single async runner for the worker."""
 
@@ -69,6 +75,7 @@ class TradingLoop:
         self._open_positions: dict[str, dict] = {}  # symbol -> position
         self._strategy_version: str = "01"
         self._last_reflected_count: int = self._restore_reflection_state()
+        self._cumulative_fees: float = self._restore_cumulative_fees()
 
     async def run(self):
         """Run the main loop — fetch, evaluate, act, heartbeat. Forever."""
@@ -291,6 +298,29 @@ class TradingLoop:
         except Exception as e:
             logger.warning(f"Failed to save reflection state: {e}")
 
+    def _restore_cumulative_fees(self) -> float:
+        """Restore cumulative fees from closed trades in trades.jsonl.
+
+        Scans all closed trades for fee_usd field and sums them.
+        Trades without fee_usd (pre-fee-modeling era) are skipped.
+        """
+        if not TRADES_PATH.exists():
+            return 0.0
+        try:
+            total = 0.0
+            for line in TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n"):
+                if not line.strip():
+                    continue
+                trade = json.loads(line)
+                if trade.get("status") == "closed" and "fee_usd" in trade:
+                    total += trade.get("fee_usd", 0.0) or 0.0
+            if total > 0:
+                logger.info(f"Restored cumulative fees: ${total:.2f}")
+            return total
+        except Exception as e:
+            logger.warning(f"Failed to restore cumulative fees: {e}")
+            return 0.0
+
     async def _check_position(self, last: float, symbol: str, strategy: dict | None = None):
         """Check if open position should be closed (stop-loss, take-profit, or time exit)."""
         position = self._open_positions.get(symbol)
@@ -363,7 +393,7 @@ class TradingLoop:
         self._append_trade(position.copy())
 
     def _close_position(self, exit_price: float, reason: str, symbol: str):
-        """Close the open position and log."""
+        """Close the open position and log. Deducts estimated exchange fees from P&L."""
         position = self._open_positions.get(symbol)
         if not position:
             return
@@ -373,21 +403,42 @@ class TradingLoop:
         direction = position.get("direction", "long")
 
         if direction == "short":
-            pnl_usd = (entry - exit_price) * qty
+            gross_pnl_usd = (entry - exit_price) * qty
         else:
-            pnl_usd = (exit_price - entry) * qty
-        pnl_pct = pnl_usd / (entry * qty) * 100
+            gross_pnl_usd = (exit_price - entry) * qty
+
+        # Fee modeling: 0.21% per side on entry + exit notional
+        entry_notional = entry * qty
+        exit_notional = exit_price * qty
+        fee_entry = entry_notional * FEE_RATE_PER_SIDE
+        fee_exit = exit_notional * FEE_RATE_PER_SIDE
+        total_fee_usd = round(fee_entry + fee_exit, 2)
+
+        # Net P&L after fees
+        net_pnl_usd = gross_pnl_usd - total_fee_usd
+        net_pnl_pct = net_pnl_usd / (entry * qty) * 100
+
+        # Also track gross for transparency
+        gross_pnl_pct = gross_pnl_usd / (entry * qty) * 100
+
+        self._cumulative_fees += total_fee_usd
 
         position["exit_price"] = exit_price
         position["exit_time"] = datetime.now(timezone.utc).isoformat()
         position["exit_reason"] = reason
-        position["pnl_usd"] = round(pnl_usd, 2)
-        position["pnl_pct"] = round(pnl_pct, 4)
+        position["pnl_usd"] = round(net_pnl_usd, 2)
+        position["pnl_pct"] = round(net_pnl_pct, 4)
+        position["pnl_usd_gross"] = round(gross_pnl_usd, 2)
+        position["pnl_pct_gross"] = round(gross_pnl_pct, 4)
+        position["fee_usd"] = total_fee_usd
+        position["fee_rate"] = FEE_RATE_ROUND_TRIP
         position["status"] = "closed"
 
         logger.info(
             f"PAPER TRADE CLOSED {symbol} ({direction}): {reason} | "
-            f"pnl=${pnl_usd:.2f} ({pnl_pct:+.2f}%)"
+            f"net=${net_pnl_usd:.2f} ({net_pnl_pct:+.2f}%) "
+            f"gross=${gross_pnl_usd:.2f} ({gross_pnl_pct:+.2f}%) "
+            f"fee=${total_fee_usd:.2f}"
         )
         self._append_trade(position.copy())
         del self._open_positions[symbol]
@@ -462,5 +513,8 @@ class TradingLoop:
             "strategy_version": self._strategy_version,
             "last_reflected_count": self._last_reflected_count,
             "consecutive_failures": self._consecutive_failures,
+            "cumulative_fees_usd": round(self._cumulative_fees, 2),
+            "fee_rate_per_side": FEE_RATE_PER_SIDE,
+            "fee_rate_round_trip": FEE_RATE_ROUND_TRIP,
         }
         HEARTBEAT_PATH.write_text(json.dumps(heartbeat, indent=2, default=str))

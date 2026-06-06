@@ -34,17 +34,30 @@ def load_trades() -> list[dict]:
     return trades
 
 
+def _net_pnl(trade: dict) -> float:
+    """Get fee-adjusted P&L from a trade record.
+
+    Uses pnl_usd (which is net-of-fees for trades recorded after fee modeling
+    was added). For legacy trades without fee_usd field, pnl_usd is already
+    the only number available, so it's used as-is.
+
+    This ensures the score function optimizes for real (fee-adjusted) profit
+    rather than gross profit that ignores exchange costs.
+    """
+    return trade.get("pnl_usd", 0.0) or 0.0
+
+
 def compute_realised_return(trades: list[dict]) -> float:
-    """Compute realised return from closed trades."""
+    """Compute fee-adjusted realised return from closed trades."""
     if not trades:
         return 0.0
-    total_pnl = sum(t.get("pnl_usd", 0.0) or 0.0 for t in trades if t.get("status") == "closed")
+    total_pnl = sum(_net_pnl(t) for t in trades if t.get("status") == "closed")
     initial_capital = 10000.0  # paper default
     return total_pnl / initial_capital
 
 
 def compute_max_drawdown(trades: list[dict]) -> float:
-    """Compute maximum drawdown from equity curve."""
+    """Compute maximum drawdown from fee-adjusted equity curve."""
     if not trades:
         return 0.0
     equity = 10000.0
@@ -52,7 +65,7 @@ def compute_max_drawdown(trades: list[dict]) -> float:
     max_dd = 0.0
     for t in trades:
         if t.get("status") == "closed":
-            equity += t.get("pnl_usd", 0.0) or 0.0
+            equity += _net_pnl(t)
             if equity > peak:
                 peak = equity
             dd = (peak - equity) / peak if peak > 0 else 0.0
@@ -62,7 +75,11 @@ def compute_max_drawdown(trades: list[dict]) -> float:
 
 
 def compute_sharpe(trades: list[dict]) -> float:
-    """Compute Sharpe ratio from trade returns."""
+    """Compute Sharpe ratio from fee-adjusted trade returns.
+
+    Uses pnl_pct which is net-of-fees for trades recorded after fee modeling.
+    Legacy trades without fee fields use their original pnl_pct (gross).
+    """
     closed = [t for t in trades if t.get("status") == "closed"]
     if len(closed) < 3:
         return 0.0
@@ -111,11 +128,17 @@ def score(trades: list[dict] | None = None, goal: dict | None = None) -> float:
     # Composite: equally weighted
     composite = (return_score + dd_score + sharpe_score) / 3.0
 
+    # Fee summary for logging
+    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    total_fees = sum(t.get("fee_usd", 0.0) or 0.0 for t in closed_trades)
+    fee_aware_count = sum(1 for t in closed_trades if "fee_usd" in t)
+
     logger.info(
         f"Score: {composite:.3f} | return={realised:+.2%} "
         f"(target={target_return:+.0%}) | DD={drawdown:.1%} "
         f"(max={max_dd:.0%}) | Sharpe={sharpe_ratio:.2f} "
-        f"(min={min_sharpe})"
+        f"(min={min_sharpe}) | fees=${total_fees:.2f} "
+        f"({fee_aware_count}/{len(closed_trades)} fee-modeled trades)"
     )
 
     return max(failure_below, min(1.0, composite))
