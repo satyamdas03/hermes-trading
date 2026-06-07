@@ -324,7 +324,7 @@ FEE MODELING CONTEXT — IMPORTANT:
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
   "changes": [
-    {"variable": "entry.threshold_short", "old_value": 70, "new_value": 75, "reason": "Raise short threshold to 75 so shorts only fire on strong overbought RSI>75, reducing false signals in bull regime"}
+    {{"variable": "entry.threshold_short", "old_value": 70, "new_value": 75, "reason": "Raise short threshold to 75 so shorts only fire on strong overbought RSI>75, reducing false signals in bull regime"}}
   ],
   "summary": "one sentence summary of what changed and why"
 }}"""
