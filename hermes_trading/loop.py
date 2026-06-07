@@ -247,14 +247,25 @@ class TradingLoop:
         lines = TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n")
 
         # First pass: collect all trade_ids that are already closed
+        # Also detect collisions where the same trade_id is used by different symbols
         closed_ids = set()
+        trade_id_to_symbol = {}
         for line in lines:
             if not line.strip():
                 continue
             try:
                 trade = json.loads(line)
+                tid = trade.get("trade_id")
+                sym = trade.get("symbol")
+                if tid and sym:
+                    if tid in trade_id_to_symbol and trade_id_to_symbol[tid] != sym:
+                        logger.warning(
+                            f"Trade ID collision detected: {tid} used by both "
+                            f"{trade_id_to_symbol[tid]} and {sym}. Data integrity may be compromised."
+                        )
+                    trade_id_to_symbol[tid] = sym
                 if trade.get("status") == "closed":
-                    closed_ids.add(trade.get("trade_id"))
+                    closed_ids.add(tid)
             except json.JSONDecodeError:
                 continue
 
@@ -371,7 +382,7 @@ class TradingLoop:
         qty = (capital * position_size_r) / last
 
         position = {
-            "trade_id": f"ppr_{int(time.time())}",
+            "trade_id": f"ppr_{symbol.replace('/', '_')}_{time.time_ns()}",
             "symbol": symbol,
             "direction": direction,
             "entry_price": last,

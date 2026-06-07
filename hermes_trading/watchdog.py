@@ -161,20 +161,23 @@ class HermesWatchdog:
         GOAL_PATH.write_text(yaml.dump(goal, default_flow_style=False, sort_keys=False))
 
         # Write trades.jsonl — append only new closed trades to avoid duplicating
-        existing_ids = set()
+        # Use (trade_id, symbol) as dedup key to handle historical trade_id collisions
+        existing_keys = set()
         if TRADES_PATH.exists():
             for line in TRADES_PATH.read_text(encoding="utf-8-sig").strip().split("\n"):
                 if line.strip():
                     try:
                         t = json.loads(line)
-                        existing_ids.add(t.get("trade_id", ""))
+                        existing_keys.add((t.get("trade_id", ""), t.get("symbol", "")))
                     except json.JSONDecodeError:
                         pass
 
-        with open(TRADES_PATH, "a") as f:
+        with open(TRADES_PATH, "a", encoding="utf-8") as f:
             for t in trades:
-                if t.get("trade_id") not in existing_ids:
+                key = (t.get("trade_id"), t.get("symbol"))
+                if key not in existing_keys:
                     f.write(json.dumps(t, default=str) + "\n")
+                    existing_keys.add(key)
 
     def _run_hermes_reflection(self, strategy: dict, trades: list[dict], goal: dict) -> dict | None:
         """Run Hermes CLI reflection on staged state. Returns updated strategy."""

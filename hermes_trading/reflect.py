@@ -213,6 +213,12 @@ THRESHOLD SEMANTICS — READ CAREFULLY:
     entry.threshold_long  = RSI level below which longs trigger
     entry.threshold_short = RSI level above which shorts trigger
 
+FEE MODELING CONTEXT — IMPORTANT:
+- All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
+- The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
+- When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
+- If a trade direction consistently shows negative net P&L after fees, consider whether that direction is viable.
+
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
   "changes": [
@@ -308,6 +314,12 @@ THRESHOLD SEMANTICS — READ CAREFULLY:
   which causes overtrading. To avoid this, ALWAYS use the explicit keys:
     entry.threshold_long  = RSI level below which longs trigger
     entry.threshold_short = RSI level above which shorts trigger
+
+FEE MODELING CONTEXT — IMPORTANT:
+- All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
+- The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
+- When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
+- If a trade direction consistently shows negative net P&L after fees, consider whether that direction is viable.
 
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
