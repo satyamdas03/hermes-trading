@@ -1,12 +1,31 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-.DS_Store
-state/heartbeat.json
-state/trades.jsonl
-state/watchdog_heartbeat.json
-state/watchdog_state.json
-state/history/
-run_watchdog.bat
-.env
+*.py[cod]
+*$py.class
 *.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Hermes state / temp files (synced externally, not version-controlled)
+*.tmp
+*.tmp.*
+state/*.jsonl
+state/*.yaml
+state/*.json
+analysis_output/
+tmp/
+
+# Windows
+*.bat
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
