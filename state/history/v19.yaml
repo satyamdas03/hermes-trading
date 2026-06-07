@@ -1,9 +1,8 @@
-version: '27'
+version: '19'
 entry:
   indicator: rsi
-  threshold_long: 40
-  threshold_short: 80
-  direction: long
+  threshold: 20
+  direction: short
 stop_loss_pct: 1.8
 take_profit_pct: 4.0
 position_size_r: 0.35

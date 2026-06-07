@@ -34,6 +34,40 @@ print(f"Closed trades: {len(closed_trades)}")
 print(f"Open trades: {len(open_trades)}")
 print()
 
+# Fee-aware vs legacy trade performance split
+print("## 1. Fee-Aware vs Legacy Trade Performance Split")
+print()
+
+fee_aware = [t for t in closed_trades if 'fee_usd' in t]
+legacy = [t for t in closed_trades if 'fee_usd' not in t]
+
+def print_split_section(label, dataset):
+    if not dataset:
+        print(f"No {label} trades.\n")
+        return
+    count = len(dataset)
+    gross = sum(t.get('pnl_usd_gross', t.get('pnl_usd', 0)) for t in dataset)
+    fees = sum(t.get('fee_usd', 0) for t in dataset)
+    net = sum(t.get('pnl_usd', 0) for t in dataset)
+    wins = sum(1 for t in dataset if t.get('pnl_usd', 0) > 0)
+    wr = wins / count * 100 if count else 0
+    avg = net / count if count else 0
+    max_loss = min(t.get('pnl_usd', 0) for t in dataset)
+    max_win = max(t.get('pnl_usd', 0) for t in dataset)
+    print(f"### {label} ({count} trades)")
+    print(f"  Gross P&L:  ${gross:+.2f}")
+    print(f"  Fees:       ${fees:+.2f}")
+    print(f"  Net P&L:    ${net:+.2f}")
+    print(f"  Win Rate:   {wins}/{count} = {wr:.1f}%")
+    print(f"  Avg P&L:    ${avg:+.2f}")
+    print(f"  Max Loss:   ${max_loss:+.2f}")
+    print(f"  Max Win:    ${max_win:+.2f}")
+    print()
+
+print_split_section("Legacy (no fee data)", legacy)
+print_split_section("Fee-aware (post-Jun 6)", fee_aware)
+print()
+
 # 1. Score trajectory over versions
 print("## 1. Score Trajectory Over Versions")
 print()
@@ -47,26 +81,6 @@ print("Note: score_before values refer to the score BEFORE the reflection that c
 print("Missing scores for some versions indicate gaps in the hypothesis log (not a bug, just incomplete logging).")
 print()
 
-# Fee modeling split
-fee_aware = [t for t in closed_trades if 'fee_usd' in t]
-legacy = [t for t in closed_trades if 'fee_usd' not in t]
-print("## 1b. Fee Modeling Impact")
-print()
-print(f"| Category | Trades | Gross P&L | Fees | Net P&L | Wins | WR |")
-print(f"|----------|--------|-----------|------|---------|------|----|")
-if legacy:
-    leg_net = sum(t.get('pnl_usd',0) for t in legacy)
-    leg_wins = sum(1 for t in legacy if t.get('pnl_usd',0) > 0)
-    print(f"| Legacy (pre-Jun 6) | {len(legacy)} | ${leg_net:+.2f} | $0.00 | ${leg_net:+.2f} | {leg_wins}/{len(legacy)} | {leg_wins/len(legacy)*100:.1f}% |")
-if fee_aware:
-    fa_gross = sum(t.get('pnl_usd_gross', t.get('pnl_usd',0)) for t in fee_aware)
-    fa_fees = sum(t.get('fee_usd',0) for t in fee_aware)
-    fa_net = sum(t.get('pnl_usd',0) for t in fee_aware)
-    fa_wins = sum(1 for t in fee_aware if t.get('pnl_usd',0) > 0)
-    print(f"| Fee-aware (post-Jun 6) | {len(fee_aware)} | ${fa_gross:+.2f} | ${fa_fees:.2f} | ${fa_net:+.2f} | {fa_wins}/{len(fee_aware)} | {fa_wins/len(fee_aware)*100:.1f}% |")
-print()
-print(f"Fee drag on gross P&L: {fa_fees/max(1,fa_gross)*100:.1f}%" if fee_aware else "")
-print()
 
 # 2. Cumulative P&L over time
 closed_sorted = sorted(closed_trades, key=lambda x: x['exit_time'])

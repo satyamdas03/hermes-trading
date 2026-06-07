@@ -172,7 +172,7 @@ class HermesWatchdog:
                     except json.JSONDecodeError:
                         pass
 
-        with open(TRADES_PATH, "a", encoding="utf-8") as f:
+        with open(TRADES_PATH, "a", encoding="utf-8-sig") as f:
             for t in trades:
                 key = (t.get("trade_id"), t.get("symbol"))
                 if key not in existing_keys:

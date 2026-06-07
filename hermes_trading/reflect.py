@@ -217,7 +217,7 @@ FEE MODELING CONTEXT — IMPORTANT:
 - All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
 - The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
 - When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
-- If a trade direction consistently shows negative net P&L after fees, consider whether that direction is viable.
+- A trade direction that is break-even gross but negative net after fees may still be viable if it contributes to Sharpe / reduces max drawdown. Do not automatically discard directions; evaluate holistically.
 
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
@@ -319,7 +319,7 @@ FEE MODELING CONTEXT — IMPORTANT:
 - All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
 - The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
 - When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
-- If a trade direction consistently shows negative net P&L after fees, consider whether that direction is viable.
+- A trade direction that is break-even gross but negative net after fees may still be viable if it contributes to Sharpe / reduces max drawdown. Do not automatically discard directions; evaluate holistically.
 
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
