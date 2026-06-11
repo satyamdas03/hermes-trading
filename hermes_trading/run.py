@@ -95,6 +95,14 @@ def main():
     logger.info(f"Booting hermes-trading worker — assets={assets}")
     logger.info(f"Mode: {__import__('os').getenv('HERMES_TRADING_MODE', 'paper')}")
 
+    # Optional read-only state API (feeds the QuantAlpha /hermes page).
+    # Railway sets PORT when the service is exposed over HTTP.
+    import os
+    api_port = os.getenv("HERMES_API_PORT") or os.getenv("PORT")
+    if api_port:
+        from hermes_trading.api import start_in_thread
+        start_in_thread(int(api_port))
+
     loop = TradingLoop(assets=assets)
     asyncio.run(loop.run())
 
