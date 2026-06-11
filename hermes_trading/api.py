@@ -111,6 +111,19 @@ def _tail_jsonl(name: str, n: int) -> list[dict]:
     return rows
 
 
+def _dedupe_trades(rows: list[dict]) -> list[dict]:
+    """trades.jsonl appends one row when a trade opens and another when it
+    closes — keep only the LATEST row per trade_id (entry order preserved)."""
+    latest: dict[str, dict] = {}
+    order: list[str] = []
+    for t in rows:
+        tid = t.get("trade_id") or ""
+        if tid not in latest:
+            order.append(tid)
+        latest[tid] = t
+    return [latest[tid] for tid in order]
+
+
 def _trade_aggregates(trades: list[dict]) -> dict:
     closed = [t for t in trades if t.get("status") == "closed"]
     open_ = [t for t in trades if t.get("status") == "open"]
@@ -144,7 +157,7 @@ def status() -> dict:
     heartbeat = _read_json("heartbeat.json")
     strategy = _read_yaml("strategy.yaml")
     goal = _read_yaml("goal.yaml")
-    trades = _tail_jsonl("trades.jsonl", 10_000)
+    trades = _dedupe_trades(_tail_jsonl("trades.jsonl", 10_000))
     return {
         "heartbeat": heartbeat,
         "strategy": strategy,
@@ -156,7 +169,8 @@ def status() -> dict:
 
 @app.get("/trades", dependencies=[Depends(_require_secret)])
 def trades(n: int = Query(default=200, ge=1, le=2000)) -> dict:
-    rows = _tail_jsonl("trades.jsonl", n)
+    # Over-fetch x2 before dedupe so n surviving trades come back
+    rows = _dedupe_trades(_tail_jsonl("trades.jsonl", n * 2))[-n:]
     # Cumulative P&L over the returned window (closed trades, entry order)
     cum = 0.0
     curve = []
