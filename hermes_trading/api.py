@@ -222,7 +222,7 @@ async def events() -> StreamingResponse:
                 yield ": keepalive\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
 def start_in_thread(port: int) -> threading.Thread:
