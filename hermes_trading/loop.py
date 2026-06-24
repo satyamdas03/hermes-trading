@@ -42,7 +42,10 @@ REFLECTION_STATE_PATH = STATE_DIR / "reflection_state.json"
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds, exponential
 CIRCUIT_BREAKER_LIMIT = 5
-REFLECTION_INTERVAL = 5  # trigger reflection every N closed trades
+# Default reflection cadence. Overridden by goal.yaml `reflection_every`.
+# Raised 5 -> 20: reflecting on 5 crypto trades is statistical noise and was the
+# direct cause of the strategy random-walking (oscillating stop_loss/direction).
+REFLECTION_INTERVAL = 20  # trigger reflection every N closed trades
 
 DEFAULT_STRATEGY = {
     "version": "01",
@@ -177,7 +180,14 @@ class TradingLoop:
         return dict(DEFAULT_STRATEGY)
 
     def _evaluate_entry(self, price_data: dict, macro_data: dict, strategy: dict) -> str | None:
-        """Evaluate entry condition. Returns 'long', 'short', or None."""
+        """Evaluate entry condition. Returns 'long', 'short', or None.
+
+        Trend filter (the key fix for the falling-knife problem): when enabled,
+        longs only fire while price is ABOVE its EMA (uptrend) and shorts only
+        while BELOW (downtrend). With direction='both' this makes the asset's own
+        trend select the side, instead of blindly buying every oversold dip in a
+        downtrend and getting stopped out.
+        """
         candles = price_data.get("candles_1m", [])
         if len(candles) < 30:
             return None
@@ -200,16 +210,41 @@ class TradingLoop:
         if threshold_short is None:
             threshold_short = (100 - legacy_threshold) if legacy_threshold is not None else 70
 
-        closes = [c["close"] for c in candles[-30:] if c.get("close")]
+        # Use the full candle window (not just last 30) so the trend EMA has data.
+        closes = [c["close"] for c in candles if c.get("close")]
+        if len(closes) < 15:
+            return None
+        last_close = closes[-1]
 
-        if indicator == "rsi" and len(closes) >= 14:
+        # --- Trend filter — don't fight the trend ---
+        trend_filter = entry.get("trend_filter", True)
+        trend_ema_period = int(entry.get("trend_ema", 30))
+        allow_long = True
+        allow_short = True
+        if trend_filter:
+            ema = self._compute_ema(closes, trend_ema_period)
+            if ema is not None:
+                allow_long = last_close > ema
+                allow_short = last_close < ema
+
+        if indicator == "rsi":
             rsi = self._compute_rsi(closes, 14)
-            if direction in ("long", "both") and rsi < threshold_long:
+            if direction in ("long", "both") and allow_long and rsi < threshold_long:
                 return "long"
-            if direction in ("short", "both") and rsi > threshold_short:
+            if direction in ("short", "both") and allow_short and rsi > threshold_short:
                 return "short"
 
         return None
+
+    def _compute_ema(self, values: list[float], period: int) -> float | None:
+        """Compute EMA for a list of values. Returns None if insufficient data."""
+        if len(values) < period:
+            return None
+        multiplier = 2.0 / (period + 1)
+        ema = sum(values[:period]) / period  # SMA seed
+        for v in values[period:]:
+            ema = (v - ema) * multiplier + ema
+        return ema
 
     def _compute_rsi(self, closes: list[float], period: int = 14) -> float:
         """Compute RSI from closing prices."""
@@ -467,9 +502,18 @@ class TradingLoop:
             if trade.get("status") == "closed":
                 closed_count += 1
 
+        # Cadence from goal.yaml (falls back to module default).
+        interval = REFLECTION_INTERVAL
+        try:
+            if GOAL_PATH.exists():
+                g = yaml.safe_load(GOAL_PATH.read_text()) or {}
+                interval = int(g.get("reflection_every", REFLECTION_INTERVAL))
+        except Exception:
+            pass
+
         new_closed = closed_count - self._last_reflected_count
-        if new_closed >= REFLECTION_INTERVAL:
-            logger.info(f"Auto-reflection triggered: {new_closed} new closed trades since last reflect (total={closed_count})")
+        if new_closed >= interval:
+            logger.info(f"Auto-reflection triggered: {new_closed} new closed trades since last reflect (total={closed_count}, interval={interval})")
             try:
                 strategy, trades, goal = load_current_state()
                 if strategy and goal:

@@ -28,6 +28,108 @@ TRADES_PATH = STATE_DIR / "trades.jsonl"
 HYPOTHESES_PATH = STATE_DIR / "hypotheses.jsonl"
 HISTORY_DIR = STATE_DIR / "history"
 GOAL_PATH = STATE_DIR / "goal.yaml"
+SCORE_STATE_PATH = STATE_DIR / "reflect_score.json"
+
+# Revert guard: if a strategy change makes the recent-window score worse by more
+# than this margin, roll the change back instead of mutating further. This closes
+# the feedback loop that was missing — previously reflection never checked whether
+# its last change helped, causing an endless random walk.
+REVERT_MARGIN = 0.05
+SCORE_WINDOW = 40  # number of recent closed trades the guard scores on
+
+
+def _recent_score(valid_trades: list[dict], goal: dict, window: int = SCORE_WINDOW) -> float:
+    """Score only the most recent `window` closed trades — responsive to the last change."""
+    closed = [t for t in valid_trades if t.get("status") == "closed"]
+    return score_func(closed[-window:], goal)
+
+
+def _load_score_state() -> dict | None:
+    """Load {version, predecessor, score} recorded at the last applied change."""
+    if not SCORE_STATE_PATH.exists():
+        return None
+    try:
+        return json.loads(SCORE_STATE_PATH.read_text())
+    except Exception:
+        return None
+
+
+def _save_score_state(version: str, predecessor: str | None, score: float) -> None:
+    """Record the score of the strategy we just left, so the next reflection can
+    judge whether the change we just applied helped or hurt."""
+    try:
+        SCORE_STATE_PATH.write_text(json.dumps({
+            "version": str(version),
+            "predecessor": str(predecessor) if predecessor is not None else None,
+            "score": round(float(score), 4),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2))
+    except Exception as e:
+        logger.warning(f"Failed to save score state: {e}")
+
+
+def _maybe_revert(valid_trades: list[dict], goal: dict) -> dict | None:
+    """If the last applied change hurt the recent-window score, roll it back.
+
+    Returns the reverted strategy dict if a revert happened, else None (proceed
+    with normal reflection). Best-effort: never raises into the loop.
+    """
+    try:
+        st = _load_score_state()
+        if not st:
+            return None
+        prev_score = st.get("score")
+        predecessor = st.get("predecessor")  # version to roll back TO
+        applied = st.get("version")          # version currently on disk (being judged)
+        if prev_score is None or predecessor is None or applied is None:
+            return None
+
+        disk = yaml.safe_load(STRATEGY_PATH.read_text()) if STRATEGY_PATH.exists() else {}
+        if str(disk.get("version")) != str(applied):
+            return None  # disk changed out from under us (manual edit / reseed) — skip
+
+        current_score = _recent_score(valid_trades, goal)
+        if current_score >= prev_score - REVERT_MARGIN:
+            return None  # change held up (or improved) — keep it
+
+        hist = HISTORY_DIR / f"v{predecessor}.yaml"
+        if not hist.exists():
+            return None
+        reverted = yaml.safe_load(hist.read_text())
+        new_version = f"{int(applied) + 1:02d}"
+        reverted["version"] = new_version
+
+        # Save current (the losing version) to history, then atomic-write the revert.
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy(STRATEGY_PATH, HISTORY_DIR / f"v{applied}.yaml")
+        temp_path = STRATEGY_PATH.with_suffix(".yaml.tmp")
+        temp_path.write_text(yaml.dump(reverted, default_flow_style=False, sort_keys=False))
+        temp_path.replace(STRATEGY_PATH)
+
+        logger.info(
+            f"REVERT GUARD: v{applied} recent score {current_score:.3f} < prior "
+            f"v{predecessor} {prev_score:.3f} (margin {REVERT_MARGIN}) — rolled back "
+            f"to v{predecessor} config as v{new_version}"
+        )
+        try:
+            _append_hypothesis({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "reflector": "revert-guard",
+                "from_version": applied,
+                "to_version": new_version,
+                "variable_changed": f"rollback to v{predecessor} config",
+                "reason": f"v{applied} recent score {current_score:.3f} fell below v{predecessor} {prev_score:.3f}",
+                "score_before": round(current_score, 4),
+                "num_trades_considered": len([t for t in valid_trades if t.get("status") == "closed"]),
+            })
+        except Exception:
+            pass
+        # The revert is itself a change we can re-evaluate next cycle.
+        _save_score_state(new_version, applied, current_score)
+        return reverted
+    except Exception as e:
+        logger.warning(f"Revert guard failed (continuing with normal reflection): {e}")
+        return None
 
 
 def load_current_state() -> tuple[dict | None, list[dict], dict | None]:
@@ -69,6 +171,11 @@ def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | N
     if len(closed_trades) < 3:
         logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
         return None
+
+    # Closed-loop guard: roll back the last change if it hurt the recent window.
+    reverted = _maybe_revert(valid_trades, goal)
+    if reverted is not None:
+        return reverted
 
     # Compute current metrics
     score_val = score_func(valid_trades, goal)
@@ -152,6 +259,10 @@ def reflect_fallback(strategy: dict, trades: list[dict], goal: dict) -> dict | N
 
     logger.info(f"Strategy updated: v{old_version} -> v{new_version} — {variable_changed}")
 
+    # Record the score of the strategy we just left so the next reflection can
+    # judge whether this change helped (revert guard).
+    _save_score_state(new_version, old_version, _recent_score(valid_trades, goal))
+
     # 5. Log hypothesis (best-effort)
     try:
         hypothesis = {
@@ -189,6 +300,11 @@ def reflect_hermes_cli(strategy: dict, trades: list[dict], goal: dict) -> dict |
         logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
         return None
 
+    # Closed-loop guard: roll back the last change if it hurt (skip the AI call).
+    reverted = _maybe_revert(valid_trades, goal)
+    if reverted is not None:
+        return reverted
+
     last_25 = closed_trades[-25:]
 
     prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
@@ -213,11 +329,17 @@ THRESHOLD SEMANTICS — READ CAREFULLY:
     entry.threshold_long  = RSI level below which longs trigger
     entry.threshold_short = RSI level above which shorts trigger
 
+TREND FILTER CONTEXT — IMPORTANT:
+- entry.trend_filter (bool) and entry.trend_ema (int) gate trades by trend: longs only
+  fire when price is ABOVE the EMA, shorts only when BELOW. This prevents buying falling
+  knives. Keep trend_filter on unless the data clearly shows it is harming results.
+
 FEE MODELING CONTEXT — IMPORTANT:
 - All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
 - The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
 - When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
-- A trade direction that is break-even gross but negative net after fees may still be viable if it contributes to Sharpe / reduces max drawdown. Do not automatically discard directions; evaluate holistically.
+- Fewer, higher-quality trades beat many marginal ones: every round trip costs ~0.42% in fees,
+  so avoid changes that sharply increase trade frequency unless win rate clearly supports it.
 
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
@@ -291,6 +413,11 @@ def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | Non
         logger.info(f"Not enough closed trades ({len(closed_trades)}) for reflection")
         return None
 
+    # Closed-loop guard: roll back the last change if it hurt (skip the AI call).
+    reverted = _maybe_revert(valid_trades, goal)
+    if reverted is not None:
+        return reverted
+
     last_25 = closed_trades[-25:]
 
     prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
@@ -315,11 +442,17 @@ THRESHOLD SEMANTICS — READ CAREFULLY:
     entry.threshold_long  = RSI level below which longs trigger
     entry.threshold_short = RSI level above which shorts trigger
 
+TREND FILTER CONTEXT — IMPORTANT:
+- entry.trend_filter (bool) and entry.trend_ema (int) gate trades by trend: longs only
+  fire when price is ABOVE the EMA, shorts only when BELOW. This prevents buying falling
+  knives. Keep trend_filter on unless the data clearly shows it is harming results.
+
 FEE MODELING CONTEXT — IMPORTANT:
 - All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
 - The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
 - When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
-- A trade direction that is break-even gross but negative net after fees may still be viable if it contributes to Sharpe / reduces max drawdown. Do not automatically discard directions; evaluate holistically.
+- Fewer, higher-quality trades beat many marginal ones: every round trip costs ~0.42% in fees,
+  so avoid changes that sharply increase trade frequency unless win rate clearly supports it.
 
 Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
 {{
@@ -453,6 +586,13 @@ def _apply_claude_reflection(
 
     change_str = ", ".join(change_descriptions)
     logger.info(f"Strategy updated via Claude: v{old_version_stamp} -> v{new_version} — {change_str}")
+
+    # Record the score of the strategy we just left so the next reflection's revert
+    # guard can judge whether this change helped.
+    try:
+        _save_score_state(new_version, old_version_stamp, _recent_score(_filter_trades(trades), goal))
+    except Exception as e:
+        logger.warning(f"Failed to record score state: {e}")
 
     # 5. Log hypothesis (best-effort; don't crash if this fails)
     try:

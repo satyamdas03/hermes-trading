@@ -1,10 +1,12 @@
-version: '27'
+version: '59'
 entry:
   indicator: rsi
-  threshold_long: 40
-  threshold_short: 80
-  direction: long
-stop_loss_pct: 1.8
+  threshold_long: 22
+  threshold_short: 78
+  direction: both
+  trend_filter: true
+  trend_ema: 30
+stop_loss_pct: 2.0
 take_profit_pct: 4.0
 position_size_r: 0.35
 max_position_age_hours: 72

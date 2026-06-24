@@ -7,8 +7,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import os
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -19,6 +23,105 @@ logger = logging.getLogger("hermes-trading")
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 GOAL_PATH = STATE_DIR / "goal.yaml"
+
+# Sound hand-tuned seed used to recover the live strategy from a degraded state.
+# Embedded here (not read from the repo file) because Railway's persistent volume
+# mounts over state/, shadowing the image's committed strategy.yaml. Applied only
+# when RESEED_STRATEGY env is truthy and not already applied (marker-guarded).
+RESEED_STRATEGY_CONFIG = {
+    "version": "59",
+    "entry": {
+        "indicator": "rsi",
+        "threshold_long": 22,
+        "threshold_short": 78,
+        "direction": "both",
+        "trend_filter": True,
+        "trend_ema": 30,
+    },
+    "stop_loss_pct": 2.0,
+    "take_profit_pct": 4.0,
+    "position_size_r": 0.35,
+    "max_position_age_hours": 72,
+}
+
+
+def _maybe_reseed_strategy() -> None:
+    """One-time reset of the live strategy to a sound seed when RESEED_STRATEGY is set.
+
+    Idempotent: writes a marker file so a left-on env flag doesn't keep resetting.
+    Also clears the reflection counter and revert-guard baseline so the agent gets
+    a fresh start rather than immediately mutating the new seed.
+    """
+    flag = os.getenv("RESEED_STRATEGY", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+
+    target_version = RESEED_STRATEGY_CONFIG["version"]
+    marker = STATE_DIR / f".reseeded_v{target_version}"
+    if marker.exists():
+        logger.info(f"RESEED_STRATEGY set but already reseeded to v{target_version} — skipping (you can remove the env flag)")
+        return
+
+    strategy_path = STATE_DIR / "strategy.yaml"
+    history_dir = STATE_DIR / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    # Back up the existing (degraded) live strategy.
+    if strategy_path.exists():
+        try:
+            old = yaml.safe_load(strategy_path.read_text()) or {}
+            old_v = old.get("version", "unknown")
+            shutil.copy(strategy_path, history_dir / f"v{old_v}.yaml")
+            logger.info(f"RESEED: backed up live strategy v{old_v} to history")
+        except Exception as e:
+            logger.warning(f"RESEED backup failed: {e}")
+
+    strategy_path.write_text(yaml.dump(RESEED_STRATEGY_CONFIG, default_flow_style=False, sort_keys=False))
+    logger.info(f"RESEED: strategy reset to v{target_version} (sound seed: trend filter on, threshold_long 22, sl 2.0 / tp 4.0)")
+
+    # Bump reflection cadence on the live volume's goal.yaml (5 -> 20). The volume
+    # shadows the image's committed goal.yaml, so we must patch it here.
+    if GOAL_PATH.exists():
+        try:
+            g = yaml.safe_load(GOAL_PATH.read_text()) or {}
+            if int(g.get("reflection_every", 5)) < 20:
+                g["reflection_every"] = 20
+                GOAL_PATH.write_text(yaml.dump(g, default_flow_style=False, sort_keys=False))
+                logger.info("RESEED: goal.reflection_every bumped to 20")
+        except Exception as e:
+            logger.warning(f"RESEED: failed to patch goal.yaml cadence: {e}")
+
+    # Reset reflection counter to current closed-trade count so it waits a full
+    # cadence before mutating the fresh seed.
+    trades_path = STATE_DIR / "trades.jsonl"
+    closed = 0
+    if trades_path.exists():
+        for line in trades_path.read_text(encoding="utf-8-sig").strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                if json.loads(line).get("status") == "closed":
+                    closed += 1
+            except Exception:
+                pass
+    try:
+        (STATE_DIR / "reflection_state.json").write_text(json.dumps({
+            "last_reflected_count": closed,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2))
+    except Exception as e:
+        logger.warning(f"RESEED: failed to reset reflection counter: {e}")
+
+    # Clear revert-guard baseline (fresh lineage).
+    score_state = STATE_DIR / "reflect_score.json"
+    if score_state.exists():
+        try:
+            score_state.unlink()
+        except Exception:
+            pass
+
+    marker.write_text(datetime.now(timezone.utc).isoformat())
+    logger.info(f"RESEED complete — reflection counter set to {closed}. You can now remove the RESEED_STRATEGY env flag.")
 
 
 def setup_logging():
@@ -85,6 +188,9 @@ def main():
 
     # Ensure state files exist (volume mount may be empty)
     _ensure_state_files()
+
+    # One-time strategy reseed when RESEED_STRATEGY is set (recover degraded live state)
+    _maybe_reseed_strategy()
 
     # Load assets from goal.yaml
     assets = [args.asset] if args.asset else None
