@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from hermes_trading.score import score as score_func
+from hermes_trading.telemetry import compute_telemetry, format_telemetry
 
 logger = logging.getLogger("hermes-trading.reflect")
 
@@ -67,6 +68,52 @@ def validate_change(variable: str, new_value) -> tuple[bool, str]:
     if lo <= v <= hi:
         return True, "ok"
     return False, f"{variable}={v} out of bounds [{lo}, {hi}]"
+
+
+def _telemetry_block(trades: list[dict], goal: dict) -> str:
+    closed = [t for t in _filter_trades(trades) if t.get("status") == "closed"]
+    return format_telemetry(compute_telemetry(closed, goal))
+
+
+def _bounds_block() -> str:
+    lines = [f"- {k}: allowed range [{lo}, {hi}]" for k, (lo, hi) in BOUNDS.items()]
+    lines.append("- entry.direction: one of long | short | both")
+    return "TUNABLE VARIABLES (change exactly ONE per cycle, must stay in range):\n" + "\n".join(lines)
+
+
+def _build_reflection_prompt(strategy: dict, last_trades: list[dict], goal: dict,
+                             telemetry_block: str) -> str:
+    return f"""You are a trading strategy optimizer. Analyze the telemetry and trades and propose
+ONE change to improve net-of-fees performance. You MUST change exactly ONE variable.
+
+Goal: {json.dumps(goal, indent=2)}
+
+{telemetry_block}
+
+Current strategy:
+{yaml.dump(strategy, default_flow_style=False, sort_keys=False)}
+
+Last {len(last_trades)} trades:
+{yaml.dump(last_trades, default_flow_style=False, sort_keys=False)}
+
+{_bounds_block()}
+
+GUIDANCE:
+- If win_rate by direction shows one side losing badly in this regime, consider entry.direction
+  or the trend filter rather than only nudging a threshold.
+- If fees are a large % of gross and trades/day is high, fewer/higher-quality trades help: widen
+  take_profit_pct vs stop_loss_pct, raise position_size_r, or tighten entry thresholds.
+- take_profit_pct should stay greater than stop_loss_pct.
+
+THRESHOLD SEMANTICS: long triggers when RSI < entry.threshold_long; short when RSI > entry.threshold_short.
+
+Respond with ONLY a JSON object:
+{{
+  "changes": [
+    {{"variable": "take_profit_pct", "old_value": 4.0, "new_value": 5.0, "reason": "..."}}
+  ],
+  "summary": "one sentence"
+}}"""
 
 
 def _recent_score(valid_trades: list[dict], goal: dict, window: int = SCORE_WINDOW) -> float:
@@ -338,47 +385,7 @@ def reflect_hermes_cli(strategy: dict, trades: list[dict], goal: dict) -> dict |
 
     last_25 = closed_trades[-25:]
 
-    prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
-ONE change to the strategy to improve performance. You MUST change exactly ONE variable.
-
-Goal: {json.dumps(goal, indent=2)}
-
-Current strategy:
-{yaml.dump(strategy, default_flow_style=False, sort_keys=False)}
-
-Last {len(last_25)} trades:
-{yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
-
-THRESHOLD SEMANTICS — READ CAREFULLY:
-- For LONG entries: trigger when RSI < entry.threshold_long
-- For SHORT entries: trigger when RSI > entry.threshold_short
-- If the strategy only has a legacy "entry.threshold" key (no _long/_short), the code derives:
-    long trigger  = RSI < threshold
-    short trigger = RSI > (100 - threshold)
-- This means setting threshold=75 for shorts actually triggers at RSI>25 (nearly always true),
-  which causes overtrading. To avoid this, ALWAYS use the explicit keys:
-    entry.threshold_long  = RSI level below which longs trigger
-    entry.threshold_short = RSI level above which shorts trigger
-
-TREND FILTER CONTEXT — IMPORTANT:
-- entry.trend_filter (bool) and entry.trend_ema (int) gate trades by trend: longs only
-  fire when price is ABOVE the EMA, shorts only when BELOW. This prevents buying falling
-  knives. Keep trend_filter on unless the data clearly shows it is harming results.
-
-FEE MODELING CONTEXT — IMPORTANT:
-- All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
-- The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
-- When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
-- Fewer, higher-quality trades beat many marginal ones: every round trip costs ~0.42% in fees,
-  so avoid changes that sharply increase trade frequency unless win rate clearly supports it.
-
-Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
-{{
-  "changes": [
-    {{"variable": "entry.threshold_short", "old_value": 70, "new_value": 75, "reason": "Raise short threshold to 75 so shorts only fire on strong overbought RSI>75, reducing false signals in bull regime"}}
-  ],
-  "summary": "one sentence summary of what changed and why"
-}}"""
+    prompt = _build_reflection_prompt(strategy, last_25, goal, _telemetry_block(trades, goal))
 
     hermes_bin = os.getenv("HERMES_BIN", "hermes")
     model = os.getenv("HERMES_MODEL", "claude-haiku-4-5-20251001")
@@ -451,47 +458,7 @@ def reflect_hermes(strategy: dict, trades: list[dict], goal: dict) -> dict | Non
 
     last_25 = closed_trades[-25:]
 
-    prompt = f"""You are a trading strategy optimizer. Analyze these trades and propose
-ONE change to the strategy to improve performance. You MUST change exactly ONE variable.
-
-Goal: {json.dumps(goal, indent=2)}
-
-Current strategy:
-{yaml.dump(strategy, default_flow_style=False, sort_keys=False)}
-
-Last {len(last_25)} trades:
-{yaml.dump(last_25, default_flow_style=False, sort_keys=False)}
-
-THRESHOLD SEMANTICS — READ CAREFULLY:
-- For LONG entries: trigger when RSI < entry.threshold_long
-- For SHORT entries: trigger when RSI > entry.threshold_short
-- If the strategy only has a legacy "entry.threshold" key (no _long/_short), the code derives:
-    long trigger  = RSI < threshold
-    short trigger = RSI > (100 - threshold)
-- This means setting threshold=75 for shorts actually triggers at RSI>25 (nearly always true),
-  which causes overtrading. To avoid this, ALWAYS use the explicit keys:
-    entry.threshold_long  = RSI level below which longs trigger
-    entry.threshold_short = RSI level above which shorts trigger
-
-TREND FILTER CONTEXT — IMPORTANT:
-- entry.trend_filter (bool) and entry.trend_ema (int) gate trades by trend: longs only
-  fire when price is ABOVE the EMA, shorts only when BELOW. This prevents buying falling
-  knives. Keep trend_filter on unless the data clearly shows it is harming results.
-
-FEE MODELING CONTEXT — IMPORTANT:
-- All trades now include realistic Kraken exchange fees (0.21% per side, 0.42% round-trip).
-- The pnl_usd field shows NET profit AFTER fees. A 4% gross winner becomes ~3.2% net after ~$15 in fees.
-- When evaluating trade performance, optimize for net P&L (pnl_usd), not gross.
-- Fewer, higher-quality trades beat many marginal ones: every round trip costs ~0.42% in fees,
-  so avoid changes that sharply increase trade frequency unless win rate clearly supports it.
-
-Respond with ONLY a JSON object with a "changes" array containing exactly ONE change:
-{{
-  "changes": [
-    {{"variable": "entry.threshold_short", "old_value": 70, "new_value": 75, "reason": "Raise short threshold to 75 so shorts only fire on strong overbought RSI>75, reducing false signals in bull regime"}}
-  ],
-  "summary": "one sentence summary of what changed and why"
-}}"""
+    prompt = _build_reflection_prompt(strategy, last_25, goal, _telemetry_block(trades, goal))
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
