@@ -1,0 +1,8 @@
+Strategy v66 | WR 37.7% | net $-154.88 | fees $1880.74
+------------------------------------------------------------
+[FAIL] score_gradient_alive     = 0.83       (target: < 0.6 of recent scores pinned at -0.04 floor)
+[FAIL] revert_guard_active      = False      (target: at least one revert-guard entry)
+[PASS] version_churn_sane       = 1.24       (target: <= 8 changes/day)
+[FAIL] fee_bleed_controlled     = 12.14      (target: fees < 5x net P&L)
+------------------------------------------------------------
+UNHEALTHY
