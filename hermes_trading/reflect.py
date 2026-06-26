@@ -37,6 +37,7 @@ SCORE_STATE_PATH = STATE_DIR / "reflect_score.json"
 # its last change helped, causing an endless random walk.
 REVERT_MARGIN = 0.05
 SCORE_WINDOW = 40  # number of recent closed trades the guard scores on
+GUARD_MIN_SAMPLE = 15  # don't judge a change until the window has enough closed trades
 
 # Hard bounds for the widened action space. The brain may tune any of these
 # (one per cycle); values outside the range are rejected, never applied.
@@ -161,6 +162,10 @@ def _maybe_revert(valid_trades: list[dict], goal: dict) -> dict | None:
         applied = st.get("version")          # version currently on disk (being judged)
         if prev_score is None or predecessor is None or applied is None:
             return None
+
+        closed_n = len([t for t in valid_trades if t.get("status") == "closed"])
+        if closed_n < GUARD_MIN_SAMPLE:
+            return None  # too few trades to judge the last change yet
 
         disk = yaml.safe_load(STRATEGY_PATH.read_text()) if STRATEGY_PATH.exists() else {}
         if str(disk.get("version")) != str(applied):
