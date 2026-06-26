@@ -37,6 +37,37 @@ SCORE_STATE_PATH = STATE_DIR / "reflect_score.json"
 REVERT_MARGIN = 0.05
 SCORE_WINDOW = 40  # number of recent closed trades the guard scores on
 
+# Hard bounds for the widened action space. The brain may tune any of these
+# (one per cycle); values outside the range are rejected, never applied.
+BOUNDS = {
+    "stop_loss_pct": (1.0, 5.0),
+    "take_profit_pct": (2.0, 10.0),
+    "position_size_r": (0.1, 0.5),
+    "max_position_age_hours": (6, 168),
+    "entry.threshold_long": (10, 45),
+    "entry.threshold_short": (55, 90),
+    "entry.trend_ema": (10, 100),
+}
+_DIRECTIONS = {"long", "short", "both"}
+
+
+def validate_change(variable: str, new_value) -> tuple[bool, str]:
+    """Return (ok, reason). Rejects unknown variables and out-of-range values."""
+    if variable == "entry.direction":
+        if new_value in _DIRECTIONS:
+            return True, "ok"
+        return False, f"entry.direction must be one of {sorted(_DIRECTIONS)}, got {new_value!r}"
+    if variable not in BOUNDS:
+        return False, f"unknown or non-tunable variable: {variable}"
+    lo, hi = BOUNDS[variable]
+    try:
+        v = float(new_value)
+    except (TypeError, ValueError):
+        return False, f"{variable} value not numeric: {new_value!r}"
+    if lo <= v <= hi:
+        return True, "ok"
+    return False, f"{variable}={v} out of bounds [{lo}, {hi}]"
+
 
 def _recent_score(valid_trades: list[dict], goal: dict, window: int = SCORE_WINDOW) -> float:
     """Score only the most recent `window` closed trades — responsive to the last change."""
@@ -535,6 +566,11 @@ def _apply_claude_reflection(
         old_value = change.get("old_value")
         reason = change.get("reason", "")
 
+        ok, why = validate_change(variable, new_value)
+        if not ok:
+            logger.warning(f"Rejected out-of-bounds change {variable}={new_value}: {why}")
+            continue
+
         # Navigate the field path (e.g. "entry.threshold")
         parts = variable.split(".")
         target = strategy
@@ -547,6 +583,10 @@ def _apply_claude_reflection(
         target[parts[-1]] = new_value
 
         change_descriptions.append(f"{variable}: {old_value} -> {new_value}")
+
+    if not change_descriptions:
+        logger.warning("All proposed changes were rejected by bounds — no mutation applied")
+        return None
 
     strategy["version"] = new_version
 
