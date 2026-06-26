@@ -141,4 +141,10 @@ def score(trades: list[dict] | None = None, goal: dict | None = None) -> float:
         f"({fee_aware_count}/{len(closed_trades)} fee-modeled trades)"
     )
 
-    return max(failure_below, min(1.0, composite))
+    # Clamp to the documented [-1, +1] range. NOTE: do NOT floor at
+    # goal.failure_below — that is a *goal threshold* (what return counts as
+    # "failing"), not a score floor. Flooring here pinned every underwater
+    # strategy at -0.04, erasing the gradient the reflection optimizer and the
+    # revert-guard rely on (they read this returned value). See score.py:136 —
+    # the real composite was logged but discarded one line later.
+    return max(-1.0, min(1.0, composite))
