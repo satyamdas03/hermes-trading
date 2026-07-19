@@ -28,6 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
+_START_TIME = time.time()
 
 # ── Live log ring buffer ─────────────────────────────────────────────────────
 # (seq, line) pairs; SSE clients poll the buffer by sequence number, which
@@ -149,7 +150,20 @@ app = FastAPI(title="hermes-trading state API", docs_url=None, redoc_url=None)
 @app.get("/health")
 def health() -> dict:
     hb = _read_json("heartbeat.json")
-    return {"status": "ok", "heartbeat_at": hb.get("timestamp") or hb.get("updated_at")}
+    heartbeat_at = hb.get("timestamp") or hb.get("updated_at")
+    heartbeat_age_seconds = None
+    if heartbeat_at:
+        try:
+            heartbeat_age_seconds = round(time.time() - float(heartbeat_at), 1)
+        except (TypeError, ValueError):
+            heartbeat_age_seconds = None
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - _START_TIME, 1),
+        "state_dir_exists": STATE_DIR.exists(),
+        "heartbeat_at": heartbeat_at,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+    }
 
 
 @app.get("/status", dependencies=[Depends(_require_secret)])
