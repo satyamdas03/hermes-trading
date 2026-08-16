@@ -210,7 +210,53 @@ def main():
         start_in_thread(int(api_port))
 
     loop = TradingLoop(assets=assets)
-    asyncio.run(loop.run())
+    _run_with_shutdown(loop)
+
+
+def _run_with_shutdown(loop: TradingLoop) -> None:
+    """Run the trading loop with graceful shutdown of cached exchange sessions.
+
+    ccxt async exchanges hold aiohttp sessions that must be closed explicitly,
+    otherwise asyncio logs "Unclosed client session" / "Unclosed connector"
+    errors on SIGTERM/SIGINT. This installs signal handlers that cancel the
+    loop and close the exchanges in the SAME event loop before exiting.
+    """
+    import signal
+    from hermes_trading.adapters import price as price_adapter
+
+    loop_obj = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop_obj)
+
+    main_task = loop_obj.create_task(loop.run())
+
+    async def _shutdown() -> None:
+        logger.info("Shutdown signal received — closing exchange sessions")
+        main_task.cancel()
+        try:
+            await main_task
+        except asyncio.CancelledError:
+            pass
+        await price_adapter.close_all()
+        loop_obj.stop()
+
+    def _on_signal() -> None:
+        asyncio.ensure_future(_shutdown())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop_obj.add_signal_handler(sig, _on_signal)
+        except (NotImplementedError, RuntimeError):
+            # Windows / non-main-thread: fall back to no graceful cleanup.
+            pass
+
+    try:
+        loop_obj.run_forever()
+    finally:
+        try:
+            loop_obj.run_until_complete(price_adapter.close_all())
+        except Exception:
+            pass
+        loop_obj.close()
 
 
 if __name__ == "__main__":

@@ -125,16 +125,39 @@ def _dedupe_trades(rows: list[dict]) -> list[dict]:
     return [latest[tid] for tid in order]
 
 
-def _trade_aggregates(trades: list[dict]) -> dict:
+def _trade_aggregates(trades: list[dict], prices: dict[str, float] | None = None) -> dict:
     closed = [t for t in trades if t.get("status") == "closed"]
     open_ = [t for t in trades if t.get("status") == "open"]
     pnls = [t.get("pnl_usd") or 0.0 for t in closed]
     wins = [p for p in pnls if p > 0]
+
+    # Unrealized P&L on open positions, using the latest heartbeat prices.
+    # The UI previously showed only realized P&L, so a freshly-started agent
+    # with open positions read as "$0" and looked broken. This surfaces the
+    # live mark-to-market so open positions show their current P&L.
+    unrealized = 0.0
+    prices = prices or {}
+    for t in open_:
+        sym = t.get("symbol", "")
+        cur = prices.get(sym)
+        if cur is None:
+            continue
+        entry = t.get("entry_price") or 0.0
+        qty = t.get("qty") or 0.0
+        direction = t.get("direction", "long")
+        if direction == "short":
+            unrealized += (entry - cur) * qty
+        else:
+            unrealized += (cur - entry) * qty
+
+    realized = sum(pnls)
     return {
         "total_trades": len(trades),
         "closed_trades": len(closed),
         "open_positions": open_,
-        "total_pnl_usd": round(sum(pnls), 2),
+        "total_pnl_usd": round(realized, 2),
+        "unrealized_pnl_usd": round(unrealized, 2),
+        "total_pnl_usd_incl_unrealized": round(realized + unrealized, 2),
         "win_rate_pct": round(len(wins) / len(closed) * 100, 1) if closed else None,
         "avg_pnl_pct": round(sum(t.get("pnl_pct") or 0.0 for t in closed) / len(closed), 3) if closed else None,
         "best_trade_usd": round(max(pnls), 2) if pnls else None,
@@ -172,11 +195,12 @@ def status() -> dict:
     strategy = _read_yaml("strategy.yaml")
     goal = _read_yaml("goal.yaml")
     trades = _dedupe_trades(_tail_jsonl("trades.jsonl", 10_000))
+    prices = heartbeat.get("prices") or {}
     return {
         "heartbeat": heartbeat,
         "strategy": strategy,
         "goal": goal,
-        "aggregates": _trade_aggregates(trades),
+        "aggregates": _trade_aggregates(trades, prices),
         "server_time": time.time(),
     }
 

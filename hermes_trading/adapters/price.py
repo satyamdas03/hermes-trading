@@ -60,6 +60,23 @@ async def _get_exchange(exchange_id: str):
     return ex
 
 
+async def close_all() -> None:
+    """Close all cached exchange instances, releasing their aiohttp sessions.
+
+    ccxt async exchanges hold an aiohttp ClientSession that must be closed
+    explicitly, otherwise asyncio logs "Unclosed client session" / "Unclosed
+    connector" errors at shutdown. Called from run.py's shutdown handler.
+    """
+    for ex_id, ex in list(_EXCHANGE_CACHE.items()):
+        try:
+            await ex.close()
+        except Exception:
+            pass
+        _EXCHANGE_CACHE.pop(ex_id, None)
+    if _EXCHANGE_CACHE:
+        _EXCHANGE_CACHE.clear()
+
+
 async def fetch(symbol: str = "BTC/USDT", exchange_id: str = "kraken") -> dict:
     """Fetch latest OHLCV and ticker data for a symbol, with exchange fallback.
 
